@@ -32,6 +32,13 @@ export interface Config {
 		// Anthropic billing). Enables Sonnet 4.6 [1m] on every plan and Opus 4.6
 		// [1m] on Pro.
 		longContextExtraUsage?: boolean;
+		// Name the default account, registering it as "claude-bridge-<name>"
+		// instead of bare "claude-bridge". Its config dir still comes from
+		// CLAUDE_CONFIG_DIR (or Claude Code's default) — this only renames the
+		// provider, so every account reads the same way in the model picker.
+		// Changing it renames the models: update pi's enabledModels to match.
+		defaultAccountName?: string;
+
 		// Additional Claude accounts. Each key <name> registers a second provider
 		// "claude-bridge-<name>" whose queries run against that account's
 		// configDir — its own settings AND its own credentials (Claude Code

@@ -161,11 +161,14 @@ const MODELS = buildModels(getModels("anthropic"));
 let providerSettings: NonNullable<Config["provider"]> = {};
 let longContextSettings: LongContextSettings = { plan: "pro", longContextExtraUsage: false };
 
-// One Claude account per registered provider. The default account (PROVIDER_ID)
-// keeps today's behavior exactly: claudeDir stays undefined, meaning "whatever
+// One Claude account per registered provider. The default account keeps today's
+// behavior exactly: claudeDir stays undefined, meaning "whatever
 // process.env.CLAUDE_CONFIG_DIR says at call time". Accounts from
 // provider.accounts always carry an explicit dir. pi stamps `provider` onto
 // every registered model, so model.provider is the routing key back to here.
+// The default account is `claude-bridge` unless provider.defaultAccountName
+// gives it a name, which makes it `claude-bridge-<name>` like any other — for
+// symmetry when every account is named (e.g. "personal" alongside "work").
 type Account = {
 	providerId: string;
 	/** Config key, used as the display-name suffix. Unset on the default account. */
@@ -192,8 +195,13 @@ function configureAccounts(provider: NonNullable<Config["provider"]>): void {
 		plan: provider.plan ?? "pro",
 		longContextExtraUsage: provider.longContextExtraUsage ?? false,
 	};
-	defaultAccount = { providerId: PROVIDER_ID, longContext: longContextSettings };
-	accountsById = new Map([[PROVIDER_ID, defaultAccount]]);
+	const defaultName = provider.defaultAccountName?.trim();
+	defaultAccount = {
+		providerId: defaultName ? `${PROVIDER_ID}-${defaultName}` : PROVIDER_ID,
+		...(defaultName ? { label: defaultName } : {}),
+		longContext: longContextSettings,
+	};
+	accountsById = new Map([[defaultAccount.providerId, defaultAccount]]);
 	for (const [name, acct] of Object.entries(provider.accounts ?? {})) {
 		if (!acct?.configDir) {
 			console.error(`claude-bridge: provider.accounts.${name} has no configDir; skipping`);
@@ -311,10 +319,11 @@ let sharedSession: SessionState | null = null;
 function convertAndImportMessages(
 	session: ReturnType<typeof createSession>,
 	messages: Context["messages"],
+	providerId: string,
 	customToolNameToSdk?: Map<string, string>,
 	carried?: readonly CarriedAttachment[],
 ): void {
-	const { anthropicMessages, sanitizedIds, dropped } = convertPiMessages(messages, customToolNameToSdk);
+	const { anthropicMessages, sanitizedIds, dropped } = convertPiMessages(messages, customToolNameToSdk, providerId);
 
 	debug(`convertAndImportMessages: ${messages.length} pi msgs → ${anthropicMessages.length} anthropic msgs`);
 	debug(`convertAndImportMessages: imported roles:`, anthropicMessages.map((m, i) => {
@@ -723,7 +732,7 @@ function syncSharedSession(
 	// so a reentrant subagent on another account with shorter priors still lands
 	// in the preserve path below instead of rebuilding the parent's live session.
 	// A top-level account toggle (priors >= cursor) falls through to REBUILD.
-	const sessionAccountMatches = (sharedSession?.providerId ?? PROVIDER_ID) === account.providerId;
+	const sessionAccountMatches = (sharedSession?.providerId ?? defaultAccount.providerId) === account.providerId;
 	if (sharedSession && sessionAccountMatches && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor) {
 		const missed = priorMessages.slice(sharedSession.cursor);
 		const trailingAssistantOnly =
@@ -787,7 +796,7 @@ function syncSharedSession(
 		...(preserveId ? { sessionId: previousSessionId } : {}),
 		...(modelId ? { model: modelId } : {}),
 	});
-	convertAndImportMessages(session, priorMessages, customToolNameToSdk, carried);
+	convertAndImportMessages(session, priorMessages, account.providerId, customToolNameToSdk, carried);
 	session.save();
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
@@ -1893,7 +1902,7 @@ async function promptAndWait(
 	// provider call will see missed messages and trigger a Case 4 rebuild.
 	let resumeSessionId: string | null = null;
 	if (!options?.isolated && options?.context?.length) {
-		if (sharedSession && (sharedSession.providerId ?? PROVIDER_ID) === PROVIDER_ID) {
+		if (sharedSession && (sharedSession.providerId ?? defaultAccount.providerId) === defaultAccount.providerId) {
 			// Provider already has a session on the default account — just resume from it
 			// Any missed messages from other providers were already handled by the provider's Case 4
 			resumeSessionId = sharedSession.sessionId;

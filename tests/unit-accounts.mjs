@@ -40,14 +40,19 @@ describe("provider registration per account", () => {
 			registerProvider: (id, config) => registered.push({ id, config }),
 			registerTool: () => {},
 		});
-		// Activation reads the real config files; whatever accounts they hold,
-		// the default provider must be first and unnamed (pi falls back to the id).
-		assert.equal(registered[0].id, "claude-bridge");
-		assert.equal(registered[0].config.name, undefined);
-		// Reconfigure and re-derive what registration WOULD produce is not
-		// possible without re-activating (the ACTIVE_STREAM_SIMPLE_KEY guard
-		// blocks a second registration), so the shape of named accounts is
-		// asserted through accountFor instead.
+		// Activation reads the real config files, so assert against the accounts
+		// they produced rather than a fixed id: the default account registers
+		// first, and only a named one carries a display name (pi otherwise falls
+		// back to the id).
+		const defaultAccount = __test.accountFor(undefined);
+		assert.equal(registered[0].id, defaultAccount.providerId);
+		assert.equal(
+			registered[0].config.name,
+			defaultAccount.label ? `Claude Code (${defaultAccount.label})` : undefined,
+		);
+		// Re-activating to check other configs would re-run every other
+		// activation side effect, so the shape of named accounts is asserted
+		// through accountFor instead.
 		__test.configureAccounts({ accounts: { work: WORK } });
 		assert.equal(__test.accountFor("claude-bridge-work").label, "work");
 		__test.configureAccounts({});
