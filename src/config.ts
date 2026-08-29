@@ -35,6 +35,15 @@ export interface Config {
 		// Model ids (e.g. "claude-future-9") whose declared 1M context Claude Code
 		// does not actually serve; pins them to the bare id at 200K.
 		forceTwoHundredK?: string[];
+		// Name the default account, registering it as "claude-bridge-<name>".
+		defaultAccountName?: string;
+		// Additional Claude accounts. Each key <name> registers a second provider
+		// "claude-bridge-<name>" whose queries run against that account's configDir.
+		accounts?: Record<string, {
+			configDir: string;
+			plan?: "pro" | "max";
+			longContextExtraUsage?: boolean;
+		}>; (Name the default account so personal/work read the same in the picker)
 		// Additional Claude accounts. Each key <name> registers a second provider
 		// "claude-bridge-<name>" whose queries run against that account's
 		// configDir — its own settings AND its own credentials (Claude Code
