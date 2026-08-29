@@ -2201,32 +2201,30 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Provider ---
 	//
-	// Guard against re-registration when the module is loaded multiple times
-	// (e.g., when spawning subagents). The shared ModelRegistry would otherwise
-	// overwrite the parent's streamSimple, breaking tool result delivery.
+	// Registration is idempotent: it always runs, but only the first module
+	// instance's streamSimple is ever installed. The shared ModelRegistry would
+	// otherwise overwrite the parent's streamSimple when the module is loaded
+	// again (e.g., when spawning subagents), breaking tool result delivery.
 	// See ACTIVE_STREAM_SIMPLE_KEY for the full mechanism.
 
 	const g = globalThis as Record<symbol, any>;
-	if (!g[ACTIVE_STREAM_SIMPLE_KEY]) {
-		// First instance: store our streamSimple and register.
-		g[ACTIVE_STREAM_SIMPLE_KEY] = streamClaudeAgentSdk;
-		for (const account of accountsById.values()) {
-			pi.registerProvider(account.providerId, {
-				...(account.label ? { name: `Claude Code (${account.label})` } : {}),
-				baseUrl: "claude-bridge",
-				apiKey: "not-used",
-				api: "claude-bridge",
-				models: applyLongContext(MODELS, account.longContext),
-				// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
-				streamSimple: streamClaudeAgentSdk as any,
-			});
-		}
-	} else {
-		// Subsequent instance (subagent session): skip registration entirely.
-		// The subagent already has access to claude-bridge models via the shared
-		// ModelRegistry from the parent's registration. Calls to those models
-		// route through the parent's streamSimple via reentrant QueryContexts.
-		debug(`provider: skipping re-registration, parent instance active (module=${moduleInstanceId})`);
+	const ownerStreamSimple = g[ACTIVE_STREAM_SIMPLE_KEY] ?? (g[ACTIVE_STREAM_SIMPLE_KEY] = streamClaudeAgentSdk);
+	if (ownerStreamSimple !== streamClaudeAgentSdk) {
+		// Subsequent instance (subagent session, or a host that reloads this module
+		// to enumerate providers). Register the same models, but keep the owning
+		// instance's streamSimple so tool results still route to the live session.
+		debug(`provider: re-registering against owner instance (module=${moduleInstanceId})`);
+	}
+	for (const account of accountsById.values()) {
+		pi.registerProvider(account.providerId, {
+			...(account.label ? { name: `Claude Code (${account.label})` } : {}),
+			baseUrl: "claude-bridge",
+			apiKey: "not-used",
+			api: "claude-bridge",
+			models: applyLongContext(MODELS, account.longContext),
+			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
+			streamSimple: ownerStreamSimple as any,
+		});
 	}
 
 	// --- AskClaude tool ---
