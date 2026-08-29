@@ -136,19 +136,33 @@ function diagDump(label: string, data: Record<string, unknown>) {
 
 // Global key to prevent re-registration of the provider across module reloads.
 //
-// Extensions like pi-subagents spawn a subagent and it loads this module
-// again. Without this guard, the subagent's call to registerProvider() would
-// overwrite the parent's `streamSimple` function reference in the shared
-// ModelRegistry. When the parent later delivers a tool result, it would call
-// the subagent's `streamSimple` (which has empty state) instead of its own.
+// This module gets loaded more than once. pi-subagents loads it again for a
+// subagent; a host like oppi loads it a third time purely to enumerate
+// providers for its model picker, a load that never runs a session. Each load
+// has its own `promptCaptures`, `sharedSession` and query state, but a whole
+// runtime shares one ModelRegistry, so whichever instance registered last owns
+// the `streamSimple` the registry calls.
 //
-// By storing the active streamSimple in a Symbol.for() global (shared across all
-// module instances), we ensure only the FIRST instance to register takes effect.
-// Subsequent instances wrap the stored function instead of overwriting it.
+// Registration therefore installs `dispatchStreamSimple`, which routes each call
+// to an instance that can actually serve the system prompt it carries:
+//   - the owning instance wins whenever it can serve the prompt, which keeps a
+//     subagent's call flowing through the parent's reentrant QueryContexts;
+//   - otherwise the instance holding a capture for that prompt serves it, which
+//     is how concurrent sessions in one host process reach their own state;
+//   - otherwise the owner, or this instance when there is no owner.
 //
-// On session_shutdown (including /reload), clearSession() resets this so a fresh
-// registration can occur for the next session.
+// Ownership is claimed at the first `before_agent_start`, not at load: an
+// enumeration-only load never sees that event, so it never becomes the owner
+// and is never handed a live turn with an empty capture map.
+//
+// On session_shutdown (including /reload), clearSession() releases ownership so
+// the next session's instance can claim it.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
+
+/** The instance currently serving live turns, and the captures it can resolve. */
+type StreamOwner = { streamSimple: typeof streamClaudeAgentSdk; captures: PromptCaptures };
+
+const globalStore = globalThis as Record<symbol, any>;
 
 // Claude Code's own builtin tools, for the AskClaude path where CC really runs
 // them. The provider path never sees these — it starts CC with `tools: []`.
@@ -2093,13 +2107,12 @@ export default function (pi: ExtensionAPI) {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		sharedSession = null;
 
-		// Clear the global streamSimple if this instance registered it.
-		// This allows /reload to work — the old instance clears the flag so
-		// the new instance can register fresh without wrapping stale state.
-		const g = globalThis as Record<symbol, any>;
-		if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) {
-			debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
-			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
+		// Release stream ownership if this instance holds it, so /reload and the
+		// next session start from a clean owner rather than a stale one.
+		const owner: StreamOwner | undefined = globalStore[ACTIVE_STREAM_SIMPLE_KEY];
+		if (owner?.streamSimple === streamClaudeAgentSdk) {
+			debug(`${event}: releasing stream ownership (module=${moduleInstanceId})`);
+			globalStore[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
 		}
 	};
 	pi.on("session_start", (event, ctx) => {
@@ -2113,6 +2126,13 @@ export default function (pi: ExtensionAPI) {
 	// Code's preset carries its own tool and permission guidance that the bridge
 	// still depends on, so both flags are forwarded as an append.
 	pi.on("before_agent_start", (event) => {
+		// First real turn in this process claims ownership. See
+		// ACTIVE_STREAM_SIMPLE_KEY: a load that only enumerates providers never
+		// reaches here, which is exactly what keeps it from serving turns.
+		if (!globalStore[ACTIVE_STREAM_SIMPLE_KEY]) {
+			debug(`before_agent_start: claiming stream ownership (module=${moduleInstanceId})`);
+			globalStore[ACTIVE_STREAM_SIMPLE_KEY] = { streamSimple: streamClaudeAgentSdk, captures: promptCaptures } satisfies StreamOwner;
+		}
 		const options = event.systemPromptOptions;
 		const hasRead = !options?.selectedTools || options.selectedTools.includes("read");
 		promptCaptures.record(event.systemPrompt, {
@@ -2210,20 +2230,21 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Provider ---
 	//
-	// Registration is idempotent: it always runs, but only the first module
-	// instance's streamSimple is ever installed. The shared ModelRegistry would
-	// otherwise overwrite the parent's streamSimple when the module is loaded
-	// again (e.g., when spawning subagents), breaking tool result delivery.
+	// Registration is idempotent: every load registers, and every load registers
+	// the same dispatcher, so it does not matter which one the registry keeps.
+	// The dispatcher decides per call which instance actually serves the turn.
 	// See ACTIVE_STREAM_SIMPLE_KEY for the full mechanism.
 
-	const g = globalThis as Record<symbol, any>;
-	const ownerStreamSimple = g[ACTIVE_STREAM_SIMPLE_KEY] ?? (g[ACTIVE_STREAM_SIMPLE_KEY] = streamClaudeAgentSdk);
-	if (ownerStreamSimple !== streamClaudeAgentSdk) {
-		// Subsequent instance (subagent session, or a host that reloads this module
-		// to enumerate providers). Register the same models, but keep the owning
-		// instance's streamSimple so tool results still route to the live session.
-		debug(`provider: re-registering against owner instance (module=${moduleInstanceId})`);
-	}
+	const dispatchStreamSimple = (model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream => {
+		const owner: StreamOwner | undefined = globalStore[ACTIVE_STREAM_SIMPLE_KEY];
+		if (owner && owner.streamSimple !== streamClaudeAgentSdk) {
+			if (owner.captures.canServe(context.systemPrompt) || !promptCaptures.canServe(context.systemPrompt)) {
+				return owner.streamSimple(model, context, options);
+			}
+			debug(`provider: serving locally, the owning instance has no capture for this prompt (module=${moduleInstanceId})`);
+		}
+		return streamClaudeAgentSdk(model, context, options);
+	};
 	for (const account of accountsById.values()) {
 		pi.registerProvider(account.providerId, {
 			...(account.label ? { name: `Claude Code (${account.label})` } : {}),
@@ -2232,7 +2253,7 @@ export default function (pi: ExtensionAPI) {
 			api: "claude-bridge",
 			models: applyLongContext(MODELS, account.longContext),
 			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
-			streamSimple: ownerStreamSimple as any,
+			streamSimple: dispatchStreamSimple as any,
 		});
 	}
 
