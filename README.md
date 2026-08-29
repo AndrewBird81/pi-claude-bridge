@@ -57,7 +57,7 @@ You could also create skills or add something to AGENTS.md to e.g. "Always call 
 
 ## Configuration
 
-Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config directory, usually `.pi/claude-bridge.json` (project; merged over global).
+Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config directory, usually `.pi/claude-bridge.json` (project; merged over global). When the agent dir is redirected (`PI_CODING_AGENT_DIR`, e.g. a host-managed per-session dir) and has no `claude-bridge.json`, the default `~/.pi/agent/claude-bridge.json` is read instead — accounts and provider settings belong to the user, not the sandbox.
 
 ```json
 {
