@@ -32,6 +32,18 @@ export interface Config {
 		// Anthropic billing). Enables Sonnet 4.6 [1m] on every plan and Opus 4.6
 		// [1m] on Pro.
 		longContextExtraUsage?: boolean;
+		// Additional Claude accounts. Each key <name> registers a second provider
+		// "claude-bridge-<name>" whose queries run against that account's
+		// configDir — its own settings AND its own credentials (Claude Code
+		// derives the credential-store entry from CLAUDE_CONFIG_DIR). The
+		// top-level plan/longContextExtraUsage above stay the default account's.
+		accounts?: Record<string, {
+			// Claude config directory for this account, e.g. "~/.claude-work".
+			// Log the account in with: CLAUDE_CONFIG_DIR=<dir> claude auth login
+			configDir: string;
+			plan?: "pro" | "max";
+			longContextExtraUsage?: boolean;
+		}>;
 	};
 }
 
