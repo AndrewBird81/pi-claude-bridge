@@ -172,6 +172,16 @@ export class PromptCaptures {
 		return { assembledPrompt: systemPrompt, custom: systemPrompt, contextFiles: [], skills: [], inherited: embedded };
 	}
 
+	/** Whether `resolveOrDerive` would return a capture rather than throw.
+	 *  Side-effect free — no recency touch — so a dispatcher can ask several
+	 *  instances which one owns a prompt before committing the call to one. */
+	canServe(systemPrompt?: string): boolean {
+		if (!systemPrompt) return false;
+		if (this.captures.has(systemPrompt)) return true;
+		if (this.reachableCaptures().some((node) => node.assembledPrompt === systemPrompt)) return true;
+		return this.findInheritedPrompts(systemPrompt, systemPrompt).length > 0;
+	}
+
 	get size(): number {
 		return this.captures.size;
 	}
