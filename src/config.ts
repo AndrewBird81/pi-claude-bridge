@@ -6,6 +6,7 @@
 
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { homedir } from "os";
 import { dirname, join } from "path";
 
 export interface Config {
@@ -69,7 +70,14 @@ export function claudeCodeSettings(provider: Config["provider"] = {}): { autoMem
 }
 
 export function globalConfigPath(): string {
-	return join(getAgentDir(), "claude-bridge.json");
+	const path = join(getAgentDir(), "claude-bridge.json");
+	if (existsSync(path)) return path;
+	// A redirected agent dir (PI_CODING_AGENT_DIR — e.g. an omnigent-managed
+	// per-session dir) starts without a claude-bridge.json, but accounts and
+	// provider settings belong to the user, not the sandbox: fall back to the
+	// default location when the redirected dir has none.
+	const fallback = join(homedir(), CONFIG_DIR_NAME, "agent", "claude-bridge.json");
+	return existsSync(fallback) ? fallback : path;
 }
 
 /** Record today's date in the global config so the startup notice shows once, preserving every
