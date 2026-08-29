@@ -21,12 +21,11 @@ import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } f
 import {
 	collectPromptSkills,
 	projectPromptCapture,
-	sharedPromptCaptures,
+	PromptCaptures,
 } from "./prompt-capture.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
-import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -135,9 +134,20 @@ function diagDump(label: string, data: Record<string, unknown>) {
 
 // --- Constants ---
 
-// Marks which bridge module instance owns the registered provider's stream fn.
-// Full registration policy (first vs later instances, shared vs own registry):
-// see the "--- Provider ---" block in activate() below.
+// Global key to prevent re-registration of the provider across module reloads.
+//
+// Extensions like pi-subagents spawn a subagent and it loads this module
+// again. Without this guard, the subagent's call to registerProvider() would
+// overwrite the parent's `streamSimple` function reference in the shared
+// ModelRegistry. When the parent later delivers a tool result, it would call
+// the subagent's `streamSimple` (which has empty state) instead of its own.
+//
+// By storing the active streamSimple in a Symbol.for() global (shared across all
+// module instances), we ensure only the FIRST instance to register takes effect.
+// Subsequent instances wrap the stored function instead of overwriting it.
+//
+// On session_shutdown (including /reload), clearSession() resets this so a fresh
+// registration can occur for the next session.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
 
 // Claude Code's own builtin tools, for the AskClaude path where CC really runs
@@ -479,7 +489,7 @@ function resultErrorText(message: SDKMessage): string | undefined {
  *
  *  pi has no typed rate-limit error — `stopReason` is only ever `"error"` and the sole carrier
  *  is `errorMessage` — so everything that reacts to a rate limit pattern-matches that string:
- *  pi-subagents gates `fallbackModels` on its own pattern list, and key-rotating extensions use
+ *  pi-subagents gates `fallbackModels` on a 35-pattern list, and key-rotating extensions use
  *  their own. Claude Code words a subscription limit as "You're out of extra usage · resets
  *  6:30pm", which matches none of them, so an exhausted quota reads as a fatal error and the
  *  fallback chain never runs (issue #58).
@@ -489,7 +499,7 @@ function resultErrorText(message: SDKMessage): string | undefined {
  *  failure and refuses to retry. */
 function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?: number }, failure: string): string {
 	const kind = rejection.rateLimitType ? ` (${rejection.rateLimitType})` : "";
-	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : ""; // resetsAt: Unix seconds (unit undocumented in the SDK; observed)
+	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : "";
 	return `Claude rate limit${kind}${resets}: ${failure}`;
 }
 
@@ -505,11 +515,6 @@ async function runIsolatedSummary(
 	options: SimpleStreamOptions | undefined,
 	stream: AssistantMessageEventStream,
 ): Promise<void> {
-	// pi 0.86 delivers compaction/branch-summary requests as a transcript: the summarization
-	// prompt folded into a leading system message ahead of the lone user message (issue #106).
-	// Recover the 0.85 shape so the extraction assertion below holds and the summarization
-	// prompt still reaches CC as its systemPrompt.
-	context = toBridgeContext(context);
 	let sdkQuery: ReturnType<typeof query> | undefined;
 	let wasAborted = false;
 	const onAbort = () => {
@@ -519,16 +524,7 @@ async function runIsolatedSummary(
 	};
 
 	try {
-		// One-off summarizer calls (compaction, branch summary, turn prefix, bug report —
-		// anything routed through pi's completeSummarization) are marked cacheRetention:
-		// "none". Any of them may appear in a future pi release without a bridge change,
-		// so route on the marker, not on which summarizer is calling. Non-summarizer calls
-		// must still match the [system,user] compaction shape exactly.
-		const isOneOffSummary = options?.cacheRetention === "none";
-		const promptText = isOneOffSummary
-			? extractUserPrompt(context.messages)
-			: extractIsolatedSummaryPrompt(context.messages);
-		if (!promptText) throw new Error("runIsolatedSummary: one-off summary without a user prompt (last message is not user?)");
+		const promptText = extractIsolatedSummaryPrompt(context.messages);
 		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 		const compactProviderSettings = loadConfig(cwd).provider;
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
@@ -714,11 +710,7 @@ function syncSharedSession(
 	modelId?: string,
 	account: Account = defaultAccount,
 ): SyncResult {
-	// System messages are pi 0.86's transcript representation of prompt and tool state, not
-	// conversation history — they are never imported into a CC session, so exclude them from
-	// the history space (priorMessages, cursor, missed) everywhere below (issue #106).
-	const history = nonSystemMessages(messages);
-	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
+	const priorMessages = messages.slice(0, turnStart(messages)); // everything before the current user turn
 
 	// REUSE path
 	//
@@ -767,7 +759,7 @@ function syncSharedSession(
 
 	// REBUILD path
 	if (priorMessages.length === 0) {
-		debug(`Case 1: clean start, ${history.length} total messages`);
+		debug(`Case 1: clean start, ${messages.length} total messages`);
 		debug(`syncResult: path=clean-start`);
 		return { sessionId: null };
 	}
@@ -828,7 +820,6 @@ export const __test = {
 	setPiUI(ui: ExtensionUIContext | null) {
 		piUI = ui;
 	},
-	toBridgeContext,
 	syncSharedSession,
 	configureAccounts,
 	accountFor,
@@ -841,9 +832,6 @@ export const __test = {
 	CC_CHILD_ENV,
 	buildMcpServers,
 	branchSummaryOutcome,
-	get promptCaptures() {
-		return promptCaptures;
-	},
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -929,10 +917,8 @@ function showStartupNoticeOnce(): void {
 }
 
 // Captures of what pi assembled per agent; see src/prompt-capture.ts for why this
-// is keyed rather than held in a single slot. One process-wide instance, shared
-// across every extension module instance: isolated subagents re-evaluate this
-// module, and the pinned stream they all route through resolves against it.
-const promptCaptures = sharedPromptCaptures((diagnostic) => {
+// is keyed rather than held in a single slot.
+const promptCaptures = new PromptCaptures(256, (diagnostic) => {
 	const first = diagnostic.matches[0];
 	debug(
 		`prompt-capture: no match for ${diagnostic.systemPrompt.length}-char system prompt. `
@@ -1559,22 +1545,6 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	showStartupNoticeOnce();
-	// pi 0.86 hands providers a transcript (prompt/tools folded into system messages) —
-	// translate to the 0.85-shaped Context every cursor write, syncSharedSession call and
-	// prompt-capture lookup below assumes (issue #106). A 0.85 host passes through unchanged.
-	context = toBridgeContext(context);
-
-	// One-off summarizer calls arrive HERE too, not only via isolatedStreamFn: /bug report
-	// (summarizeForBugReport) routes through agent.streamFunction -> streamSimple, with no
-	// takeover hook. pi marks every one-off summarizer with cacheRetention:"none" in
-	// completeSummarization, so route on the marker: their prompt is never recorded by the
-	// capture boundaries and resolveOrDerive would throw. Hand them to the isolated path
-	// (separate persistSession:false CC process, no session sync needed).
-	if (options?.cacheRetention === "none") {
-		debug(`provider: one-off summarizer call (cacheRetention none) routed to isolated summary, msgs=${context.messages.length}`);
-		return isolatedStreamFn(model, context, options);
-	}
-
 	const stream = newAssistantMessageEventStream();
 
 	// DEBUG: trace followUp message triggering
@@ -1650,9 +1620,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
 	// replaces that exact inherited prompt with its already-safe portable parts.
-	// Derive the key from the transcript replay (toBridgeContext), NOT from the
-	// recorded keys: under a forced prompt the transcript head is projected via
-	// transformContext after turn_start, so ctx.getSystemPrompt() is not the head.
 	const promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
 	const systemPromptAppend = promptCapture
 		? projectPromptCapture(promptCapture, {
@@ -2106,10 +2073,6 @@ export default function (pi: ExtensionAPI) {
 	providerSettings = config.provider ?? {};
 	// We need these settings to know if we're eligible for 1M context on certain models
 	configureAccounts(providerSettings);
-	const registeredModels = applyLongContext(MODELS, defaultAccount.longContext);
-	if (registeredModels.length === 0) {
-		console.error("claude-bridge: no models available from pi-ai's anthropic catalog — update @earendil-works/pi-ai (requires >=0.85.0)");
-	}
 
 	if (!config.startupNoticeShown) {
 		if (config.provider?.plan === undefined) pendingNotices.push('Are you using a Max plan? You need to set provider.plan to "max" to unlock 1M context in Opus.');
@@ -2140,59 +2103,15 @@ export default function (pi: ExtensionAPI) {
 	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
 	// Code's preset carries its own tool and permission guidance that the bridge
 	// still depends on, so both flags are forwarded as an append.
-	//
-	// The options (custom/append/contextFiles/skills) are pi config, stable across a
-	// turn; only the auto-generated tool list in the rendered prompt varies. Stash them
-	// at before_agent_start so the agent_start recording below can reuse them.
-	type RecordOptions = Parameters<typeof recordSystemPrompt>[2];
-	let lastSystemPromptOptions: RecordOptions | undefined;
-	function recordSystemPrompt(source: string, systemPrompt: string | undefined, options: {
-		customPrompt?: string;
-		appendSystemPrompt?: string;
-		contextFiles?: { path: string; content: string }[];
-		skills?: Parameters<typeof promptCaptures.record>[1]["skills"];
-		selectedTools?: string[];
-	} | undefined) {
-		if (!systemPrompt) return;
+	pi.on("before_agent_start", (event) => {
+		const options = event.systemPromptOptions;
 		const hasRead = !options?.selectedTools || options.selectedTools.includes("read");
-		promptCaptures.record(systemPrompt, {
+		promptCaptures.record(event.systemPrompt, {
 			custom: options?.customPrompt,
 			append: options?.appendSystemPrompt,
 			contextFiles: options?.contextFiles ?? [],
 			skills: hasRead ? options?.skills ?? [] : [],
-		}, source);
-	}
-	pi.on("before_agent_start", (event) => {
-		lastSystemPromptOptions = event.systemPromptOptions;
-		recordSystemPrompt("before_agent_start", event.systemPrompt, event.systemPromptOptions);
-	});
-	// The prompt the provider actually queries with is the fully-widened one: MCP tool
-	// descriptions merge into the system prompt only after their servers connect, which
-	// is after before_agent_start. ctx.getSystemPrompt() returns that widened prompt by
-	// agent_start (verified: before_agent_start=10,988 chars vs agent_start/query=23,479).
-	// A subagent embeds the widened parent prompt verbatim (pi-subagents reads
-	// ctx.getSystemPrompt() at dispatch), so unless the widened prompt is a capture key
-	// too, the child's turn resolves against nothing, falls to a verbatim side request,
-	// and ships pi's harness — tripping the server's third-party plan-eligibility check
-	// ("out of extra usage"). Recording it here, before the query, restores the match.
-	//
-	// The widening needs pi's section-based prompt (post-0.85.1); on 0.85.1 the prompt is
-	// a fixed string and this record is a redundant-but-harmless second key that still
-	// catches a later handler rewriting the prompt (it also captures a handler-returned
-	// forceSystemPrompt, which buildSystemPrompt renders verbatim).
-	pi.on("agent_start", (_event, ctx) => {
-		recordSystemPrompt("agent_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
-	});
-
-	// Mid-run re-renders: turn_start fires before every turn (first turn included, both
-	// architectures) after the turn's prompt is final: prepareNextTurnWithContext has
-	// re-rendered the options (pi's section-based prompt) and any mid-run
-	// setActiveToolsByName rebuild (0.85.1) already landed. Re-keying at each boundary
-	// the prompt can change at keeps exact-match alive mid-run. The stashed options can
-	// lag a mid-run tool-loadout change, which skews the hasRead skills filter until the
-	// next before_agent_start — accepted: a stale skills list beats failing the turn.
-	pi.on("turn_start", (_event, ctx) => {
-		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
+		});
 	});
 	pi.on("session_shutdown", () => {
 		reportLeaks("session_shutdown");
@@ -2282,66 +2201,29 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Provider ---
 	//
-	// Registration policy across module instances (a subagent session can load
-	// this module fresh): the FIRST instance registers unconditionally at load,
-	// which is what puts claude-bridge models in the picker before any session
-	// starts. Later instances decide at session_start, when ctx.modelRegistry
-	// reveals who owns this session's registry:
-	//
-	// - Registry already has the provider (host passes the parent's registry down,
-	//   e.g. pi-subagents >=0.14.3): skip. Re-registering would overwrite the
-	//   parent's pinned streamSimple with this instance's fresh — empty-state —
-	//   stream fn, and the parent's next tool-result delivery would route into it.
-	// - Registry lacks the provider (host gives the child its own, e.g. older
-	//   pi-subagents forks): register, or every claude-bridge/* dispatch in the
-	//   child fails with "Model not found" (#91). Even loading the bridge via the
-	//   agent's `extensions:` frontmatter didn't help there — the module loaded,
-	//   hit the old skip-guard, and the child's registry stayed empty.
-	//
-	// A per-instance stream fn registered into a per-instance registry is
-	// self-consistent: that session's traffic flows through this module state,
-	// which starts clean and serves only that session.
-	//
-	// On session_shutdown (including /reload), clearSession() resets
-	// ACTIVE_STREAM_SIMPLE_KEY so a freshly loaded module can register as first
-	// again.
+	// Registration is idempotent: it always runs, but only the first module
+	// instance's streamSimple is ever installed. The shared ModelRegistry would
+	// otherwise overwrite the parent's streamSimple when the module is loaded
+	// again (e.g., when spawning subagents), breaking tool result delivery.
+	// See ACTIVE_STREAM_SIMPLE_KEY for the full mechanism.
 
 	const g = globalThis as Record<symbol, any>;
-	const providerConfig = {
-		baseUrl: "claude-bridge",
-		apiKey: "not-used",
-		api: "claude-bridge",
-		models: registeredModels,
-		// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
-		streamSimple: streamClaudeAgentSdk as any,
-	};
-	if (!g[ACTIVE_STREAM_SIMPLE_KEY]) {
-		// First instance: store our streamSimple and register.
-		g[ACTIVE_STREAM_SIMPLE_KEY] = streamClaudeAgentSdk;
-		for (const account of accountsById.values()) {
-			pi.registerProvider(account.providerId, {
-				...(account.label ? { name: `Claude Code (${account.label})` } : {}),
-				baseUrl: "claude-bridge",
-				apiKey: "not-used",
-				api: "claude-bridge",
-				models: applyLongContext(MODELS, account.longContext),
-				// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
-				streamSimple: streamClaudeAgentSdk as any,
-			});
-		}
-	} else {
-		// Later instance: register only if this session's registry lacks the provider.
-		debug(`provider: deferring registration decision to session_start (module=${moduleInstanceId})`);
-		pi.on("session_start", (_event, ctx) => {
-			for (const account of accountsById.values()) {
-				if (ctx.modelRegistry.getProvider(account.providerId)) continue;
-				debug(`provider: registry lacks ${account.providerId}, registering (module=${moduleInstanceId})`);
-				pi.registerProvider(account.providerId, {
-					...(account.label ? { name: `Claude Code (${account.label})` } : {}),
-					...providerConfig,
-					models: applyLongContext(MODELS, account.longContext),
-				});
-			}
+	const ownerStreamSimple = g[ACTIVE_STREAM_SIMPLE_KEY] ?? (g[ACTIVE_STREAM_SIMPLE_KEY] = streamClaudeAgentSdk);
+	if (ownerStreamSimple !== streamClaudeAgentSdk) {
+		// Subsequent instance (subagent session, or a host that reloads this module
+		// to enumerate providers). Register the same models, but keep the owning
+		// instance's streamSimple so tool results still route to the live session.
+		debug(`provider: re-registering against owner instance (module=${moduleInstanceId})`);
+	}
+	for (const account of accountsById.values()) {
+		pi.registerProvider(account.providerId, {
+			...(account.label ? { name: `Claude Code (${account.label})` } : {}),
+			baseUrl: "claude-bridge",
+			apiKey: "not-used",
+			api: "claude-bridge",
+			models: applyLongContext(MODELS, account.longContext),
+			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
+			streamSimple: ownerStreamSimple as any,
 		});
 	}
 
