@@ -47,6 +47,15 @@ describe("MODELS projection", () => {
 		assert.deepEqual(models.map((m) => m.id), ["claude-haiku-4-5"]);
 	});
 
+	it("derives claude-fable-5-1 from the claude-fable-5 entry pi-ai does ship", () => {
+		// pi-ai 0.84.4 has no 5.1 entry; without the fallback the row vanishes silently.
+		const models = buildModels([mockPiAiModel("claude-fable-5")]);
+		const fable = find(models, "claude-fable-5-1");
+		assert.equal(fable?.name, "Claude Fable 5.1");
+		assert.equal(fable?.maxTokens, 8000);
+		assert.equal(find(models, "claude-fable-5"), undefined);
+	});
+
 	it("zeros out cost regardless of pi-ai pricing", () => {
 		const models = buildModels(MODEL_IDS_IN_ORDER.map(mockPiAiModel));
 		for (const m of models) {

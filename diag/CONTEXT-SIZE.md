@@ -42,6 +42,8 @@ the footnote below the table).
 | `claude-opus-4-6[1m]`    | 429              | 1M              | 1M               | 1M              |
 | `claude-fable-5`          | 200K             | —               | —                | —               |
 | `claude-fable-5[1m]`     | 1M               | —               | —                | —               |
+| `claude-fable-5-1`‡       | —                | —               | 1M               | —               |
+| `claude-fable-5-1[1m]`‡  | —                | —               | 1M               | —               |
 | `claude-sonnet-5`         | 200K             | —               | —                | —               |
 | `claude-sonnet-5[1m]`    | 1M               | —               | —                | —               |
 | `claude-sonnet-4-6`       | 200K             | 200K            | 200K             | 200K            |
@@ -53,6 +55,14 @@ Raw runs: `.test-output/context-size/{pro,max}-2026-06-26T21-*.json`
 
 `—` = not yet tested in that condition. Max-credits-on matched Pro-credits-on
 for every cell tested in both (shown for completeness).
+
+‡ **Measured on a later Claude Code.** Both `claude-fable-5-1` rows were probed
+on 2026-09-01 with SDK 0.3.257 / Claude Code 2.1.257, not the 2.1.141 the rest of
+the table used — Claude Code below 2.1.251 rejects the id outright (`API Error:
+400 … does not support this model; version 2.1.251 or newer is required`). Bare
+`claude-fable-5-1` serves 1M, so the bridge requests it without the `[1m]`
+suffix, as with `opus-4-7`. Whether bare ids for the other models also changed
+under 2.1.257 was not re-probed; every `[1m]` mapping still served 1M.
 
 † **Inferred, not directly measured.** The Pro-credits-off run predates
 error-field capture; its three rejected `[1m]` rows have no recorded HTTP status
