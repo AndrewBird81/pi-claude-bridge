@@ -46,8 +46,7 @@ function registryWith(provider) {
 describe("provider registration across module instances", () => {
 	it("first instance registers at activation", () => {
 		const { registered } = activateWithMockPi();
-		assert.equal(registered.length, 1, "exactly one activation-time registration");
-		assert.equal(registered[0].name, PROVIDER_ID);
+		assert.ok(registered.some(({ name }) => name.startsWith(PROVIDER_ID)), "default provider registers at activation");
 	});
 
 	it("later instance registers at session_start when its registry lacks the provider (#91)", async () => {
@@ -58,21 +57,20 @@ describe("provider registration across module instances", () => {
 		assert.equal(registered.length, 0, "no activation-time registration for a later instance");
 
 		emit("session_start", {}, { modelRegistry: registryWith("other-provider") });
-		assert.equal(registered.length, 1, "session_start registers into the empty registry");
-		assert.equal(registered[0].name, PROVIDER_ID);
-		assert.ok(registered[0].config.streamSimple, "the registration carries this instance's stream fn");
+		assert.ok(registered.some(({ name }) => name.startsWith(PROVIDER_ID)), "session_start registers the default provider");
+		assert.ok(registered.every(({ config }) => config.streamSimple), "registrations carry this instance's stream fn");
 	});
 
 	it("later instance does not re-register when the registry already has the provider", async () => {
 		const { default: activateFresh } = await import("../src/index.js?shared-registry-child");
 		const { registered, emit } = activateWithMockPi(activateFresh);
 
-		// Host passed the parent's registry down: the provider is already there.
-		emit("session_start", {}, { modelRegistry: registryWith(PROVIDER_ID) });
+		// Host passed the parent's registry down: every configured provider is already there.
+		emit("session_start", {}, { modelRegistry: { getProvider: () => ({ name: "already-registered" }) } });
 		assert.equal(registered.length, 0, "no overwrite of the parent's registration");
 
 		// Repeated session starts stay idempotent.
-		emit("session_start", {}, { modelRegistry: registryWith(PROVIDER_ID) });
+		emit("session_start", {}, { modelRegistry: { getProvider: () => ({ name: "already-registered" }) } });
 		assert.equal(registered.length, 0, "still no registration on a later session_start");
 	});
 });

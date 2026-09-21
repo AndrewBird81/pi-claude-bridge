@@ -102,6 +102,8 @@ export type DroppedContent = {
 export function convertPiMessages(
 	messages: PiMessage[],
 	customToolNameToSdk?: Map<string, string>,
+	/** The account whose session this history is being rebuilt into. */
+	providerId: string = PROVIDER_ID,
 ): { anthropicMessages: SessionMessage[]; sanitizedIds: Map<string, string>; dropped: DroppedContent } {
 	const anthropicMessages = [];
 	const sanitizedIds = new Map();
@@ -138,11 +140,12 @@ export function convertPiMessages(
 				if (block.type === "text" && block.text) {
 					blocks.push({ type: "text", text: block.text });
 				} else if (block.type === "thinking") {
-					// Only replay thinking Claude Code itself produced. A signature minted
-					// by any other provider — including pi's own Anthropic provider — is
-					// not ours to hand back, and Anthropic rejects ones it can't verify.
+					// Only replay thinking this account's Claude Code produced. A signature
+					// minted by any other provider — including pi's own Anthropic provider,
+					// or another claude-bridge account — is not ours to hand back, and
+					// Anthropic rejects ones it can't verify.
 					const sig = block.thinkingSignature;
-					if (msg.provider === PROVIDER_ID && sig) {
+					if (msg.provider === providerId && sig) {
 						blocks.push({ type: "thinking", thinking: block.thinking ?? "", signature: sig });
 					} else {
 						dropped.thinking++;
