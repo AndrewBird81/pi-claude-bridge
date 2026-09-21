@@ -21,11 +21,12 @@ import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } f
 import {
 	collectPromptSkills,
 	projectPromptCapture,
-	PromptCaptures,
+	sharedPromptCaptures,
 } from "./prompt-capture.js";
 import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachment } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
+import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -134,35 +135,10 @@ function diagDump(label: string, data: Record<string, unknown>) {
 
 // --- Constants ---
 
-// Global key to prevent re-registration of the provider across module reloads.
-//
-// This module gets loaded more than once. pi-subagents loads it again for a
-// subagent; a host like oppi loads it a third time purely to enumerate
-// providers for its model picker, a load that never runs a session. Each load
-// has its own `promptCaptures`, `sharedSession` and query state, but a whole
-// runtime shares one ModelRegistry, so whichever instance registered last owns
-// the `streamSimple` the registry calls.
-//
-// Registration therefore installs `dispatchStreamSimple`, which routes each call
-// to an instance that can actually serve the system prompt it carries:
-//   - the owning instance wins whenever it can serve the prompt, which keeps a
-//     subagent's call flowing through the parent's reentrant QueryContexts;
-//   - otherwise the instance holding a capture for that prompt serves it, which
-//     is how concurrent sessions in one host process reach their own state;
-//   - otherwise the owner, or this instance when there is no owner.
-//
-// Ownership is claimed at the first `before_agent_start`, not at load: an
-// enumeration-only load never sees that event, so it never becomes the owner
-// and is never handed a live turn with an empty capture map.
-//
-// On session_shutdown (including /reload), clearSession() releases ownership so
-// the next session's instance can claim it.
+// Marks which bridge module instance owns the registered provider's stream fn.
+// Full registration policy (first vs later instances, shared vs own registry):
+// see the "--- Provider ---" block in activate() below.
 const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
-
-/** The instance currently serving live turns, and the captures it can resolve. */
-type StreamOwner = { streamSimple: typeof streamClaudeAgentSdk; captures: PromptCaptures };
-
-const globalStore = globalThis as Record<symbol, any>;
 
 // Claude Code's own builtin tools, for the AskClaude path where CC really runs
 // them. The provider path never sees these — it starts CC with `tools: []`.
@@ -174,62 +150,6 @@ const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
 const MODELS = buildModels(getModels("anthropic"));
 let providerSettings: NonNullable<Config["provider"]> = {};
 let longContextSettings: LongContextSettings = { plan: "pro", longContextExtraUsage: false };
-
-// One Claude account per registered provider. The default account keeps today's
-// behavior exactly: claudeDir stays undefined, meaning "whatever
-// process.env.CLAUDE_CONFIG_DIR says at call time". Accounts from
-// provider.accounts always carry an explicit dir. pi stamps `provider` onto
-// every registered model, so model.provider is the routing key back to here.
-// The default account is `claude-bridge` unless provider.defaultAccountName
-// gives it a name, which makes it `claude-bridge-<name>` like any other — for
-// symmetry when every account is named (e.g. "personal" alongside "work").
-type Account = {
-	providerId: string;
-	/** Config key, used as the display-name suffix. Unset on the default account. */
-	label?: string;
-	claudeDir?: string;
-	longContext: LongContextSettings;
-};
-
-let defaultAccount: Account = { providerId: PROVIDER_ID, longContext: longContextSettings };
-let accountsById = new Map<string, Account>([[PROVIDER_ID, defaultAccount]]);
-
-function accountFor(providerId: string | undefined): Account {
-	return (providerId !== undefined ? accountsById.get(providerId) : undefined) ?? defaultAccount;
-}
-
-/** The CLAUDE_CONFIG_DIR this account's session I/O and child processes should see. */
-function claudeDirFor(account: Account): string | undefined {
-	return account.claudeDir ?? process.env.CLAUDE_CONFIG_DIR;
-}
-
-/** Rebuild the account map from config. Called once at activation. */
-function configureAccounts(provider: NonNullable<Config["provider"]>): void {
-	longContextSettings = {
-		plan: provider.plan ?? "pro",
-		longContextExtraUsage: provider.longContextExtraUsage ?? false,
-	};
-	const defaultName = provider.defaultAccountName?.trim();
-	defaultAccount = {
-		providerId: defaultName ? `${PROVIDER_ID}-${defaultName}` : PROVIDER_ID,
-		...(defaultName ? { label: defaultName } : {}),
-		longContext: longContextSettings,
-	};
-	accountsById = new Map([[defaultAccount.providerId, defaultAccount]]);
-	for (const [name, acct] of Object.entries(provider.accounts ?? {})) {
-		if (!acct?.configDir) {
-			console.error(`claude-bridge: provider.accounts.${name} has no configDir; skipping`);
-			continue;
-		}
-		const providerId = `${PROVIDER_ID}-${name}`;
-		accountsById.set(providerId, {
-			providerId,
-			label: name,
-			claudeDir: acct.configDir.replace(/^~(?=$|\/)/, homedir()),
-			longContext: { plan: acct.plan ?? "pro", longContextExtraUsage: acct.longContextExtraUsage ?? false },
-		});
-	}
-}
 
 function resolveModel(input: string) {
 	return _resolveModel(MODELS, input);
@@ -280,10 +200,6 @@ interface SessionState {
 	sessionId: string;
 	cursor: number;
 	cwd: string;
-	// Account (provider) this session belongs to. Its files live under that
-	// account's config dir, so a query on another account must not resume it.
-	// Absent means the default account (pre-multi-account states in tests).
-	providerId?: string;
 	// Force the next syncSharedSession call down the REBUILD path. Set when
 	// pi has mutated its messages array out from under us (compact, tree
 	// navigation) or after an abort left the JSONL in an indeterminate state.
@@ -306,9 +222,9 @@ interface SessionState {
  * Must be called before `deleteSession`, which wipes the file they live in —
  * reading after it yields nothing, with no error to notice.
  */
-function readCarriedAttachments(sessionId: string, cwd: string, claudeDir: string | undefined): CarriedAttachment[] {
+function readCarriedAttachments(sessionId: string, cwd: string): CarriedAttachment[] {
 	try {
-		const previous = openSession({ sessionId, projectPath: cwd, claudeDir });
+		const previous = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
 		return collectCarriedAttachments(previous.records);
 	} catch (error) {
 		// A post-abort rebuild reads a file the killed CC subprocess may have been
@@ -333,11 +249,10 @@ let sharedSession: SessionState | null = null;
 function convertAndImportMessages(
 	session: ReturnType<typeof createSession>,
 	messages: Context["messages"],
-	providerId: string,
 	customToolNameToSdk?: Map<string, string>,
 	carried?: readonly CarriedAttachment[],
 ): void {
-	const { anthropicMessages, sanitizedIds, dropped } = convertPiMessages(messages, customToolNameToSdk, providerId);
+	const { anthropicMessages, sanitizedIds, dropped } = convertPiMessages(messages, customToolNameToSdk);
 
 	debug(`convertAndImportMessages: ${messages.length} pi msgs → ${anthropicMessages.length} anthropic msgs`);
 	debug(`convertAndImportMessages: imported roles:`, anthropicMessages.map((m, i) => {
@@ -512,7 +427,7 @@ function resultErrorText(message: SDKMessage): string | undefined {
  *
  *  pi has no typed rate-limit error — `stopReason` is only ever `"error"` and the sole carrier
  *  is `errorMessage` — so everything that reacts to a rate limit pattern-matches that string:
- *  pi-subagents gates `fallbackModels` on a 35-pattern list, and key-rotating extensions use
+ *  pi-subagents gates `fallbackModels` on its own pattern list, and key-rotating extensions use
  *  their own. Claude Code words a subscription limit as "You're out of extra usage · resets
  *  6:30pm", which matches none of them, so an exhausted quota reads as a fatal error and the
  *  fallback chain never runs (issue #58).
@@ -522,7 +437,7 @@ function resultErrorText(message: SDKMessage): string | undefined {
  *  failure and refuses to retry. */
 function describeRateLimitFailure(rejection: { rateLimitType?: string; resetsAt?: number }, failure: string): string {
 	const kind = rejection.rateLimitType ? ` (${rejection.rateLimitType})` : "";
-	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : "";
+	const resets = rejection.resetsAt ? ` — resets ${new Date(rejection.resetsAt * 1000).toLocaleTimeString()}` : ""; // resetsAt: Unix seconds (unit undocumented in the SDK; observed)
 	return `Claude rate limit${kind}${resets}: ${failure}`;
 }
 
@@ -538,6 +453,11 @@ async function runIsolatedSummary(
 	options: SimpleStreamOptions | undefined,
 	stream: AssistantMessageEventStream,
 ): Promise<void> {
+	// pi 0.86 delivers compaction/branch-summary requests as a transcript: the summarization
+	// prompt folded into a leading system message ahead of the lone user message (issue #106).
+	// Recover the 0.85 shape so the extraction assertion below holds and the summarization
+	// prompt still reaches CC as its systemPrompt.
+	context = toBridgeContext(context);
 	let sdkQuery: ReturnType<typeof query> | undefined;
 	let wasAborted = false;
 	const onAbort = () => {
@@ -547,19 +467,26 @@ async function runIsolatedSummary(
 	};
 
 	try {
-		const promptText = extractIsolatedSummaryPrompt(context.messages);
+		// One-off summarizer calls (compaction, branch summary, turn prefix, bug report —
+		// anything routed through pi's completeSummarization) are marked cacheRetention:
+		// "none". Any of them may appear in a future pi release without a bridge change,
+		// so route on the marker, not on which summarizer is calling. Non-summarizer calls
+		// must still match the [system,user] compaction shape exactly.
+		const isOneOffSummary = options?.cacheRetention === "none";
+		const promptText = isOneOffSummary
+			? extractUserPrompt(context.messages)
+			: extractIsolatedSummaryPrompt(context.messages);
 		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 		const compactProviderSettings = loadConfig(cwd).provider;
 		const claudeExecutable = compactProviderSettings?.pathToClaudeCodeExecutable;
-		const account = accountFor((model as { provider?: string }).provider);
-		const cliModel = claudeCodeModelId(model, account.longContext);
+		const cliModel = claudeCodeModelId(model, longContextSettings);
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
 
 		sdkQuery = query({
 			prompt: promptText,
 			options: {
 				cwd,
-				env: { ...process.env, ...CC_CHILD_ENV, ...(account.claudeDir ? { CLAUDE_CONFIG_DIR: account.claudeDir } : {}) },
+				env: { ...process.env, ...CC_CHILD_ENV },
 				settings: { autoMemoryEnabled: false },
 				tools: [],
 				strictMcpConfig: true,
@@ -662,19 +589,18 @@ function verifyWrittenSession(
 	expectedSessionId: string,
 	expectedRecordCount: number,
 	cwd: string,
-	claudeDir?: string,
 ): void {
 	const warnings = _verifyWrittenSession(jsonlPath, expectedSessionId, expectedRecordCount);
 	for (const msg of warnings) {
 		debug(`WARNING session verify: ${msg}`);
 		piUI?.notify(
 			`Session file issue: ${msg}\n` +
-			`cwd=${cwd} realpath=${safeRealpath(cwd)} claudeDir=${claudeDir ?? "(default)"}\n` +
+			`cwd=${cwd} realpath=${safeRealpath(cwd)} CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR ?? "(unset)"}\n` +
 			`Please copy and paste this message into a new issue at https://github.com/elidickinson/pi-claude-bridge/issues/new` +
 			(DEBUG ? ` and attach ${DEBUG_LOG_PATH}` : ` (rerun with CLAUDE_BRIDGE_DEBUG=1 to capture a debug log)`),
 			"warning",
 		);
-		diagDump("session_verify_fail", { msg, jsonlPath, cwd, realpath: safeRealpath(cwd), claudeDir: claudeDir ?? null });
+		diagDump("session_verify_fail", { msg, jsonlPath, cwd, realpath: safeRealpath(cwd), claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null });
 	}
 }
 
@@ -685,7 +611,7 @@ function safeRealpath(p: string): string {
 // Diagnostic snapshot of where a session file was just written. Catches the
 // class of bugs where pi writes to ~/.claude/projects/<X> but CC SDK reads
 // from ~/.claude/projects/<Y> (symlinks, CLAUDE_CONFIG_DIR, hash mismatch).
-function debugSessionPaths(label: string, cwd: string, jsonlPath: string, claudeDir?: string): void {
+function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void {
 	const realCwd = safeRealpath(cwd);
 	let fileSize: number | null = null;
 	let fileExists = false;
@@ -698,7 +624,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string, claude
 	if (realCwd !== cwd) debug(`${label}: realpath(cwd)=${realCwd} (DIFFERS — symlink-resolved path is what CC SDK uses)`);
 	debug(`${label}: jsonlPath=${jsonlPath}`);
 	debug(`${label}: fileExists=${fileExists}${fileSize != null ? ` size=${fileSize}` : ""}`);
-	debug(`${label}: claudeDir=${claudeDir ?? "(default)"} env.CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR ?? "(unset)"} HOME=${process.env.HOME ?? "(unset)"}`);
+	debug(`${label}: env.CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR ?? "(unset)"} HOME=${process.env.HOME ?? "(unset)"}`);
 }
 
 // Two semantic paths:
@@ -731,9 +657,12 @@ function syncSharedSession(
 	cwd: string,
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
-	account: Account = defaultAccount,
 ): SyncResult {
-	const priorMessages = messages.slice(0, turnStart(messages)); // everything before the current user turn
+	// System messages are pi 0.86's transcript representation of prompt and tool state, not
+	// conversation history — they are never imported into a CC session, so exclude them from
+	// the history space (priorMessages, cursor, missed) everywhere below (issue #106).
+	const history = nonSystemMessages(messages);
+	const priorMessages = history.slice(0, turnStart(history)); // everything before the current user turn
 
 	// REUSE path
 	//
@@ -742,12 +671,7 @@ function syncSharedSession(
 	// pi-side history rewrites such as /compact and session_tree: without it,
 	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
 	// longer CC session. See issue #25.
-	// Account mismatch fails this guard rather than forcing a rebuild directly,
-	// so a reentrant subagent on another account with shorter priors still lands
-	// in the preserve path below instead of rebuilding the parent's live session.
-	// A top-level account toggle (priors >= cursor) falls through to REBUILD.
-	const sessionAccountMatches = (sharedSession?.providerId ?? defaultAccount.providerId) === account.providerId;
-	if (sharedSession && sessionAccountMatches && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor) {
+	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length >= sharedSession.cursor) {
 		const missed = priorMessages.slice(sharedSession.cursor);
 		const trailingAssistantOnly =
 			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
@@ -782,7 +706,7 @@ function syncSharedSession(
 
 	// REBUILD path
 	if (priorMessages.length === 0) {
-		debug(`Case 1: clean start, ${messages.length} total messages`);
+		debug(`Case 1: clean start, ${history.length} total messages`);
 		debug(`syncResult: path=clean-start`);
 		return { sessionId: null };
 	}
@@ -793,29 +717,24 @@ function syncSharedSession(
 	// and for any tools that key off them. Skipped only when there's a
 	// concurrent writer we shouldn't race — see forceRotate docs above.
 	const preserveId = previousSessionId !== undefined && !sharedSession?.forceRotate;
-	// The previous session's files live under ITS account's dir — read and wipe
-	// there, then create under the requesting account's dir. On a cross-account
-	// toggle these differ; using only the new dir would silently lose carried
-	// attachments and orphan the old file.
-	const previousDir = claudeDirFor(accountFor(sharedSession?.providerId));
 	// Before deleteSession — it wipes the file these live in.
-	const carried = previousSessionId !== undefined ? readCarriedAttachments(previousSessionId, cwd, previousDir) : [];
+	const carried = previousSessionId !== undefined ? readCarriedAttachments(previousSessionId, cwd) : [];
 	if (preserveId) {
 		// Wipe prior jsonl + companion dir (no-op if nothing to wipe).
-		deleteSession(previousSessionId!, cwd, previousDir);
+		deleteSession(previousSessionId!, cwd, process.env.CLAUDE_CONFIG_DIR);
 	}
 	const session = createSession({
 		projectPath: cwd,
-		claudeDir: claudeDirFor(account),
+		claudeDir: process.env.CLAUDE_CONFIG_DIR,
 		...(preserveId ? { sessionId: previousSessionId } : {}),
 		...(modelId ? { model: modelId } : {}),
 	});
-	convertAndImportMessages(session, priorMessages, account.providerId, customToolNameToSdk, carried);
+	convertAndImportMessages(session, priorMessages, customToolNameToSdk, carried);
 	session.save();
 	// records, not messages: `messages` filters out the attachment records that
 	// carrying an `@file` expansion across a rebuild writes into the same file.
-	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd, claudeDirFor(account));
-	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd, providerId: account.providerId };
+	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
+	sharedSession = { sessionId: session.sessionId, cursor: priorMessages.length, cwd };
 	if (previousSessionId === undefined) {
 		debug(`Case 2: first turn with ${priorMessages.length} prior messages → session ${session.sessionId.slice(0, 8)}, ${session.records.length} records`);
 	} else if (preserveId) {
@@ -824,7 +743,7 @@ function syncSharedSession(
 	} else {
 		debug(`Case 4 post-abort: ${priorMessages.length} total → new session ${session.sessionId.slice(0, 8)} (was ${previousSessionId.slice(0, 8)}, rotated to avoid race with orphan writer), ${session.records.length} records`);
 	}
-	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath, claudeDirFor(account));
+	debugSessionPaths(`${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
 	debug(`syncResult: path=rebuild sessionId=${session.sessionId} priors=${priorMessages.length} ${previousSessionId === undefined ? "first" : preserveId ? "preserved" : "rotated-post-abort"}`);
 	return { sessionId: session.sessionId };
 }
@@ -843,9 +762,8 @@ export const __test = {
 	setPiUI(ui: ExtensionUIContext | null) {
 		piUI = ui;
 	},
+	toBridgeContext,
 	syncSharedSession,
-	configureAccounts,
-	accountFor,
 	extractUserPromptBlocks,
 	consumeQuery,
 	finalizeCurrentStream,
@@ -855,6 +773,9 @@ export const __test = {
 	CC_CHILD_ENV,
 	buildMcpServers,
 	branchSummaryOutcome,
+	get promptCaptures() {
+		return promptCaptures;
+	},
 };
 
 // --- Provider helpers: tool name mapping ---
@@ -940,8 +861,10 @@ function showStartupNoticeOnce(): void {
 }
 
 // Captures of what pi assembled per agent; see src/prompt-capture.ts for why this
-// is keyed rather than held in a single slot.
-const promptCaptures = new PromptCaptures(256, (diagnostic) => {
+// is keyed rather than held in a single slot. One process-wide instance, shared
+// across every extension module instance: isolated subagents re-evaluate this
+// module, and the pinned stream they all route through resolves against it.
+const promptCaptures = sharedPromptCaptures((diagnostic) => {
 	const first = diagnostic.matches[0];
 	debug(
 		`prompt-capture: no match for ${diagnostic.systemPrompt.length}-char system prompt. `
@@ -1568,6 +1491,10 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
  *  Two cases: tool result delivery (active query) or fresh query. */
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	showStartupNoticeOnce();
+	// pi 0.86 hands providers a transcript (prompt/tools folded into system messages) —
+	// translate to the 0.85-shaped Context every cursor write, syncSharedSession call and
+	// prompt-capture lookup below assumes (issue #106). A 0.85 host passes through unchanged.
+	context = toBridgeContext(context);
 	const stream = newAssistantMessageEventStream();
 
 	// DEBUG: trace followUp message triggering
@@ -1643,6 +1570,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
 	// replaces that exact inherited prompt with its already-safe portable parts.
+	// Derive the key from the transcript replay (toBridgeContext), NOT from the
+	// recorded keys: under a forced prompt the transcript head is projected via
+	// transformContext after turn_start, so ctx.getSystemPrompt() is not the head.
 	const promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
 	const systemPromptAppend = promptCapture
 		? projectPromptCapture(promptCapture, {
@@ -1663,11 +1593,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	queryCtx.latestCursor = 0;
 
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-	const account = accountFor((model as { provider?: string }).provider);
 	// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
 	// pi-registered id. Log cliModel so debug lines reflect what CC actually received.
-	const cliModel = claudeCodeModelId(model, account.longContext);
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, account);
+	const cliModel = claudeCodeModelId(model, longContextSettings);
+	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel);
 	const { sessionId: resumeSessionId } = syncResult;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
@@ -1731,7 +1660,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// also autocompact would double-flush the prompt cache and races pi's
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
-	const childEnv = { ...process.env, ...CC_CHILD_ENV, ...(account.claudeDir ? { CLAUDE_CONFIG_DIR: account.claudeDir } : {}) };
+	const childEnv = { ...process.env, ...CC_CHILD_ENV };
 	const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 		cwd,
 		env: childEnv,
@@ -1820,15 +1749,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			const sessionId = capturedSessionId ?? sharedSession?.sessionId;
 			if (syncResult.preserveSharedSession) {
 				if (capturedSessionId && capturedSessionId !== sharedSession?.sessionId) {
-					// The ephemeral session was written by THIS query's child, under this account's dir.
-					deleteSession(capturedSessionId, cwd, claudeDirFor(account));
+					deleteSession(capturedSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
 					debug(`provider: query done, deleted ephemeral session ${capturedSessionId.slice(0, 8)} to preserve shared session`);
 				}
 				debug(`provider: query done, ignoring captured session ${capturedSessionId?.slice(0, 8) ?? "none"} to preserve shared session`);
 			} else if (sessionId) {
 				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
-				sharedSession = { sessionId, cursor, cwd, providerId: account.providerId };
+				sharedSession = { sessionId, cursor, cwd };
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
@@ -1907,8 +1835,7 @@ async function promptAndWait(
 	const requestedModel = options?.model ?? "opus";
 	const model = resolveModel(requestedModel);
 	const modelId = model?.id ?? requestedModel;
-	// AskClaude always runs on the default account (its env is untouched).
-	const cliModel = model ? claudeCodeModelId(model, defaultAccount.longContext) : modelId;
+	const cliModel = model ? claudeCodeModelId(model, longContextSettings) : modelId;
 
 	// Session resume for shared mode — reuse provider's session if it exists,
 	// otherwise create one from pi's context.
@@ -1916,15 +1843,12 @@ async function promptAndWait(
 	// provider call will see missed messages and trigger a Case 4 rebuild.
 	let resumeSessionId: string | null = null;
 	if (!options?.isolated && options?.context?.length) {
-		if (sharedSession && (sharedSession.providerId ?? defaultAccount.providerId) === defaultAccount.providerId) {
-			// Provider already has a session on the default account — just resume from it
+		if (sharedSession) {
+			// Provider already has a session — just resume from it
 			// Any missed messages from other providers were already handled by the provider's Case 4
 			resumeSessionId = sharedSession.sessionId;
 		} else {
-			// No default-account provider session yet (none at all, or the shared
-			// session belongs to another account, whose config dir this child
-			// cannot see) — create one from pi's context. syncSharedSession's
-			// account-mismatch guard handles rebuilding away a foreign session.
+			// No provider session yet — create one from pi's context
 			const contextWithPrompt = [...options.context, { role: "user" as const, content: prompt, timestamp: Date.now() }];
 			const sync = syncSharedSession(contextWithPrompt as Context["messages"], cwd, undefined, cliModel);
 			resumeSessionId = sync.sessionId;
@@ -2095,7 +2019,20 @@ export default function (pi: ExtensionAPI) {
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
 	// We need these settings to know if we're eligible for 1M context on certain models
-	configureAccounts(providerSettings);
+	// Validate at the boundary: a non-array here would throw inside every
+	// claudeCodeModelId call and brick the extension at activation.
+	const forceTwoHundredK = Array.isArray(providerSettings.forceTwoHundredK)
+		? providerSettings.forceTwoHundredK.filter((id): id is string => typeof id === "string")
+		: undefined;
+	longContextSettings = {
+		plan: providerSettings.plan ?? "pro",
+		longContextExtraUsage: providerSettings.longContextExtraUsage ?? false,
+		forceTwoHundredK,
+	};
+	const registeredModels = applyLongContext(MODELS, longContextSettings);
+	if (registeredModels.length === 0) {
+		console.error("claude-bridge: no models available from pi-ai's anthropic catalog — update @earendil-works/pi-ai (requires >=0.85.0)");
+	}
 
 	if (!config.startupNoticeShown) {
 		if (config.provider?.plan === undefined) pendingNotices.push('Are you using a Max plan? You need to set provider.plan to "max" to unlock 1M context in Opus.');
@@ -2107,12 +2044,13 @@ export default function (pi: ExtensionAPI) {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 		sharedSession = null;
 
-		// Release stream ownership if this instance holds it, so /reload and the
-		// next session start from a clean owner rather than a stale one.
-		const owner: StreamOwner | undefined = globalStore[ACTIVE_STREAM_SIMPLE_KEY];
-		if (owner?.streamSimple === streamClaudeAgentSdk) {
-			debug(`${event}: releasing stream ownership (module=${moduleInstanceId})`);
-			globalStore[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
+		// Clear the global streamSimple if this instance registered it.
+		// This allows /reload to work — the old instance clears the flag so
+		// the new instance can register fresh without wrapping stale state.
+		const g = globalThis as Record<symbol, any>;
+		if (g[ACTIVE_STREAM_SIMPLE_KEY] === streamClaudeAgentSdk) {
+			debug(`${event}: clearing ACTIVE_STREAM_SIMPLE_KEY`);
+			g[ACTIVE_STREAM_SIMPLE_KEY] = undefined;
 		}
 	};
 	pi.on("session_start", (event, ctx) => {
@@ -2125,22 +2063,59 @@ export default function (pi: ExtensionAPI) {
 	// `--system-prompt` replaces pi's default rather than adding to it, but Claude
 	// Code's preset carries its own tool and permission guidance that the bridge
 	// still depends on, so both flags are forwarded as an append.
-	pi.on("before_agent_start", (event) => {
-		// First real turn in this process claims ownership. See
-		// ACTIVE_STREAM_SIMPLE_KEY: a load that only enumerates providers never
-		// reaches here, which is exactly what keeps it from serving turns.
-		if (!globalStore[ACTIVE_STREAM_SIMPLE_KEY]) {
-			debug(`before_agent_start: claiming stream ownership (module=${moduleInstanceId})`);
-			globalStore[ACTIVE_STREAM_SIMPLE_KEY] = { streamSimple: streamClaudeAgentSdk, captures: promptCaptures } satisfies StreamOwner;
-		}
-		const options = event.systemPromptOptions;
+	//
+	// The options (custom/append/contextFiles/skills) are pi config, stable across a
+	// turn; only the auto-generated tool list in the rendered prompt varies. Stash them
+	// at before_agent_start so the agent_start recording below can reuse them.
+	type RecordOptions = Parameters<typeof recordSystemPrompt>[2];
+	let lastSystemPromptOptions: RecordOptions | undefined;
+	function recordSystemPrompt(source: string, systemPrompt: string | undefined, options: {
+		customPrompt?: string;
+		appendSystemPrompt?: string;
+		contextFiles?: { path: string; content: string }[];
+		skills?: Parameters<typeof promptCaptures.record>[1]["skills"];
+		selectedTools?: string[];
+	} | undefined) {
+		if (!systemPrompt) return;
 		const hasRead = !options?.selectedTools || options.selectedTools.includes("read");
-		promptCaptures.record(event.systemPrompt, {
+		promptCaptures.record(systemPrompt, {
 			custom: options?.customPrompt,
 			append: options?.appendSystemPrompt,
 			contextFiles: options?.contextFiles ?? [],
 			skills: hasRead ? options?.skills ?? [] : [],
-		});
+		}, source);
+	}
+	pi.on("before_agent_start", (event) => {
+		lastSystemPromptOptions = event.systemPromptOptions;
+		recordSystemPrompt("before_agent_start", event.systemPrompt, event.systemPromptOptions);
+	});
+	// The prompt the provider actually queries with is the fully-widened one: MCP tool
+	// descriptions merge into the system prompt only after their servers connect, which
+	// is after before_agent_start. ctx.getSystemPrompt() returns that widened prompt by
+	// agent_start (verified: before_agent_start=10,988 chars vs agent_start/query=23,479).
+	// A subagent embeds the widened parent prompt verbatim (pi-subagents reads
+	// ctx.getSystemPrompt() at dispatch), so unless the widened prompt is a capture key
+	// too, the child's turn resolves against nothing, falls to a verbatim side request,
+	// and ships pi's harness — tripping the server's third-party plan-eligibility check
+	// ("out of extra usage"). Recording it here, before the query, restores the match.
+	//
+	// The widening needs pi's section-based prompt (post-0.85.1); on 0.85.1 the prompt is
+	// a fixed string and this record is a redundant-but-harmless second key that still
+	// catches a later handler rewriting the prompt (it also captures a handler-returned
+	// forceSystemPrompt, which buildSystemPrompt renders verbatim).
+	pi.on("agent_start", (_event, ctx) => {
+		recordSystemPrompt("agent_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
+	});
+
+	// Mid-run re-renders: turn_start fires before every turn (first turn included, both
+	// architectures) after the turn's prompt is final: prepareNextTurnWithContext has
+	// re-rendered the options (pi's section-based prompt) and any mid-run
+	// setActiveToolsByName rebuild (0.85.1) already landed. Re-keying at each boundary
+	// the prompt can change at keeps exact-match alive mid-run. The stashed options can
+	// lag a mid-run tool-loadout change, which skews the hasRead skills filter until the
+	// next before_agent_start — accepted: a stale skills list beats failing the turn.
+	pi.on("turn_start", (_event, ctx) => {
+		recordSystemPrompt("turn_start", ctx.getSystemPrompt(), lastSystemPromptOptions);
 	});
 	pi.on("session_shutdown", () => {
 		reportLeaks("session_shutdown");
@@ -2230,30 +2205,53 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Provider ---
 	//
-	// Registration is idempotent: every load registers, and every load registers
-	// the same dispatcher, so it does not matter which one the registry keeps.
-	// The dispatcher decides per call which instance actually serves the turn.
-	// See ACTIVE_STREAM_SIMPLE_KEY for the full mechanism.
+	// Registration policy across module instances (a subagent session can load
+	// this module fresh): the FIRST instance registers unconditionally at load,
+	// which is what puts claude-bridge models in the picker before any session
+	// starts. Later instances decide at session_start, when ctx.modelRegistry
+	// reveals who owns this session's registry:
+	//
+	// - Registry already has the provider (host passes the parent's registry down,
+	//   e.g. pi-subagents >=0.14.3): skip. Re-registering would overwrite the
+	//   parent's pinned streamSimple with this instance's fresh — empty-state —
+	//   stream fn, and the parent's next tool-result delivery would route into it.
+	// - Registry lacks the provider (host gives the child its own, e.g. older
+	//   pi-subagents forks): register, or every claude-bridge/* dispatch in the
+	//   child fails with "Model not found" (#91). Even loading the bridge via the
+	//   agent's `extensions:` frontmatter didn't help there — the module loaded,
+	//   hit the old skip-guard, and the child's registry stayed empty.
+	//
+	// A per-instance stream fn registered into a per-instance registry is
+	// self-consistent: that session's traffic flows through this module state,
+	// which starts clean and serves only that session.
+	//
+	// On session_shutdown (including /reload), clearSession() resets
+	// ACTIVE_STREAM_SIMPLE_KEY so a freshly loaded module can register as first
+	// again.
 
-	const dispatchStreamSimple = (model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream => {
-		const owner: StreamOwner | undefined = globalStore[ACTIVE_STREAM_SIMPLE_KEY];
-		if (owner && owner.streamSimple !== streamClaudeAgentSdk) {
-			if (owner.captures.canServe(context.systemPrompt) || !promptCaptures.canServe(context.systemPrompt)) {
-				return owner.streamSimple(model, context, options);
-			}
-			debug(`provider: serving locally, the owning instance has no capture for this prompt (module=${moduleInstanceId})`);
-		}
-		return streamClaudeAgentSdk(model, context, options);
+	const g = globalThis as Record<symbol, any>;
+	const providerConfig = {
+		baseUrl: "claude-bridge",
+		apiKey: "not-used",
+		api: "claude-bridge",
+		models: registeredModels,
+		// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
+		streamSimple: streamClaudeAgentSdk as any,
 	};
-	for (const account of accountsById.values()) {
-		pi.registerProvider(account.providerId, {
-			...(account.label ? { name: `Claude Code (${account.label})` } : {}),
-			baseUrl: "claude-bridge",
-			apiKey: "not-used",
-			api: "claude-bridge",
-			models: applyLongContext(MODELS, account.longContext),
-			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
-			streamSimple: dispatchStreamSimple as any,
+	if (!g[ACTIVE_STREAM_SIMPLE_KEY]) {
+		// First instance: store our streamSimple and register.
+		g[ACTIVE_STREAM_SIMPLE_KEY] = streamClaudeAgentSdk;
+		pi.registerProvider(PROVIDER_ID, providerConfig);
+	} else {
+		// Later instance: register only if this session's registry lacks the provider.
+		debug(`provider: deferring registration decision to session_start (module=${moduleInstanceId})`);
+		pi.on("session_start", (_event, ctx) => {
+			if (ctx.modelRegistry.getProvider(PROVIDER_ID)) {
+				debug(`provider: registry already has ${PROVIDER_ID}, skipping registration (module=${moduleInstanceId})`);
+				return;
+			}
+			debug(`provider: registry lacks ${PROVIDER_ID}, registering (module=${moduleInstanceId})`);
+			pi.registerProvider(PROVIDER_ID, providerConfig);
 		});
 	}
 
