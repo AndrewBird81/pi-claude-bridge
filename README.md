@@ -59,6 +59,8 @@ You could also create skills or add something to AGENTS.md to e.g. "Always call 
 
 Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config directory, usually `.pi/claude-bridge.json` (project; merged over global).
 
+When the agent dir is redirected (`PI_CODING_AGENT_DIR`, e.g. a host-managed per-session dir) and has no `claude-bridge.json`, the default `~/.pi/agent/claude-bridge.json` is read instead — accounts and provider settings belong to the user, not the sandbox.
+
 ```json
 {
   "askClaude": {
@@ -93,6 +95,48 @@ Config: `~/.pi/agent/claude-bridge.json` (global) or the project Pi config direc
 - `strictMcpConfig` — block MCP servers from `~/.claude.json` / `.mcp.json` (default `true`). Cloud MCP (Gmail/Drive via claude.ai OAuth) is always blocked.
 - `autoMemoryEnabled` — enable Claude Code's auto-memory system (default `false`)
 - `pathToClaudeCodeExecutable` — path to the `claude` binary. Useful if your OS/filesystem has the SDK's bundled musl/glibc binaries in a place where they can't run. For example, with Nix you can set the binary to e.g. `"/home/you/.nix-profile/bin/claude"`.
+- `accounts` — additional Claude subscriptions, each shown as its own provider in the model picker (see below).
+- `defaultAccountName` — name the default account so it registers as `claude-bridge-<name>` instead of bare `claude-bridge` (see below).
+
+### Multiple Claude accounts
+
+To use a second Claude subscription (say, work and personal) in the same pi session:
+
+```json
+{
+  "provider": {
+    "plan": "pro",
+    "accounts": {
+      "work": { "configDir": "~/.claude-work", "plan": "max" }
+    }
+  }
+}
+```
+
+Each entry registers a provider `claude-bridge-<name>` ("Claude Code (<name>)" in the picker) whose queries run against that account's `configDir` — its own settings *and* its own credentials, since Claude Code derives the credential-store entry from `CLAUDE_CONFIG_DIR`. The top-level `plan`/`longContextExtraUsage` stay with the default account; each entry takes its own.
+
+Log the account in once, interactively:
+
+```sh
+CLAUDE_CONFIG_DIR=~/.claude-work claude auth login
+```
+
+Switching accounts mid-session works; the switch rebuilds the Claude Code session under the other account (one prompt-cache miss, same as switching to any other provider). AskClaude always runs on the default account.
+
+The default account stays bare `claude-bridge`, which reads oddly next to a named one. `defaultAccountName` names it too:
+
+```json
+{
+  "provider": {
+    "defaultAccountName": "personal",
+    "accounts": {
+      "work": { "configDir": "~/.claude-work", "plan": "max" }
+    }
+  }
+}
+```
+
+That registers `claude-bridge-personal` and `claude-bridge-work` and nothing bare. The default account still takes its config dir from `CLAUDE_CONFIG_DIR` (or Claude Code's default) — only the provider name changes. Because the name is part of every model ID, update pi's `enabledModels` (and any pinned `defaultProvider`/`defaultModel`) to match; sessions already pinned to a `claude-bridge/…` model will not resolve until repointed.
 
 
 **Startup notice:** the first interactive session to reach Claude Code lists whichever of `provider.plan` and `askClaude.enabled` you have left unset, then records `startupNoticeShown` (the date, `YYYY-MM-DD`) in the global config so it doesn't nag again.

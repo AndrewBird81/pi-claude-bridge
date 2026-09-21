@@ -1,0 +1,47 @@
+name: Check fork
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          # pi-coding-agent uses node:fs globSync (Node >=22.19).
+          node-version: 22.19.0
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:unit
+      - name: Verify upstream baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline=$(cat .upstream-release)
+          git fetch --no-tags https://github.com/elidickinson/pi-claude-bridge.git "refs/tags/$baseline:refs/tags/$baseline"
+          git merge-base --is-ancestor "$baseline" HEAD
+          read -r behind ahead < <(git rev-list --left-right --count "$baseline...HEAD")
+          test "$behind" = 0
+          test "$ahead" -gt 0
+      - name: Verify fork diff stays within the FORK.md ledger
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline=$(cat .upstream-release)
+          # Ancestry alone cannot detect a rebase that kept the fork's copy of old
+          # upstream code. Bound the source diff to the files the ledger explains,
+          # and keep upstream's changelog untouched.
+          unexplained=$(comm -23 \
+            <(git diff --name-only "$baseline" HEAD -- src/ CHANGELOG.md | sort) \
+            <(printf '%s\n' src/config.ts src/convert.ts src/index.ts | sort))
+          if [[ -n "$unexplained" ]]; then
+            echo "diff against $baseline touches files outside the FORK.md ledger:" >&2
+            echo "$unexplained" >&2
+            exit 1
+          fi
