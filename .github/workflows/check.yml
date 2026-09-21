@@ -1,0 +1,30 @@
+name: Check fork
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:unit
+      - name: Verify upstream baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline=$(cat .upstream-release)
+          git fetch --no-tags https://github.com/elidickinson/pi-claude-bridge.git "refs/tags/$baseline:refs/tags/$baseline"
+          git merge-base --is-ancestor "$baseline" HEAD
+          read -r behind ahead < <(git rev-list --left-right --count "$baseline...HEAD")
+          test "$behind" = 0
+          test "$ahead" -gt 0

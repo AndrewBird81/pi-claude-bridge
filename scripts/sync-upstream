@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+if [[ -n "$(git status --short)" ]]; then
+  echo "sync-upstream: worktree is dirty; commit or stash changes first" >&2
+  exit 1
+fi
+
+upstream_remote=${UPSTREAM_REMOTE:-upstream}
+git fetch --tags "$upstream_remote"
+
+release=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname \
+  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+if [[ -z "$release" ]]; then
+  echo "sync-upstream: no stable release tag found" >&2
+  exit 1
+fi
+
+baseline=$(cat .upstream-release 2>/dev/null || true)
+if [[ "$baseline" == "$release" ]]; then
+  echo "upstream is already synchronized at $release"
+  exit 0
+fi
+old_head=$(git rev-parse HEAD)
+if [[ -z "$baseline" ]] || ! git rev-parse --verify "$baseline^{commit}" >/dev/null 2>&1; then
+  echo "sync-upstream: .upstream-release must name an ancestor tag/commit" >&2
+  exit 1
+fi
+
+mapfile -t custom_commits < <(git rev-list --reverse "$baseline..$old_head")
+if ((${#custom_commits[@]} == 0)); then
+  echo "sync-upstream: no fork commits found after $baseline" >&2
+  exit 1
+fi
+
+branch="sync/upstream-${release#v}"
+if git show-ref --verify --quiet "refs/heads/$branch"; then
+  echo "sync-upstream: branch $branch already exists; remove it or choose another worktree" >&2
+  exit 1
+fi
+
+git switch -c "$branch" "$release"
+for commit in "${custom_commits[@]}"; do
+  git cherry-pick "$commit" || {
+    echo "sync-upstream: conflict while applying $commit; resolve manually, then run git cherry-pick --continue" >&2
+    exit 1
+  }
+done
+
+printf '%s\n' "$release" > .upstream-release
+git add .upstream-release
+if ! git diff --cached --quiet; then
+  git commit -m "Track upstream $release"
+fi
+
+echo "Created $branch on $release. Review conflicts and git diff $release..HEAD."
+echo "No push or deployment was performed."
