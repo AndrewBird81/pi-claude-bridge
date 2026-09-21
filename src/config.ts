@@ -5,8 +5,9 @@
 // unparseable file is ignored (error to console.error, empty object returned)
 // so the extension always starts.
 
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "fs";
+import { homedir } from "os";
 import { join } from "path";
 
 export interface Config {
@@ -27,6 +28,15 @@ export interface Config {
 		// Model ids (e.g. "claude-future-9") whose declared 1M context Claude Code
 		// does not actually serve; pins them to the bare id at 200K.
 		forceTwoHundredK?: string[];
+		// Name the default account, registering it as "claude-bridge-<name>".
+		defaultAccountName?: string;
+		// Additional Claude accounts. Each key <name> registers a second provider
+		// "claude-bridge-<name>" whose queries run against that account's configDir.
+		accounts?: Record<string, {
+			configDir: string;
+			plan?: "pro" | "max";
+			longContextExtraUsage?: boolean;
+		}>;
 	};
 }
 
@@ -45,7 +55,14 @@ export function claudeCodeSettings(provider: Config["provider"] = {}): { autoMem
 }
 
 export function globalConfigPath(): string {
-	return join(getAgentDir(), "claude-bridge.json");
+	const path = join(getAgentDir(), "claude-bridge.json");
+	if (existsSync(path)) return path;
+	// A redirected agent dir (PI_CODING_AGENT_DIR — e.g. an omnigent-managed
+	// per-session dir) starts without a claude-bridge.json, but accounts and
+	// provider settings belong to the user, not the sandbox: fall back to the
+	// default location when the redirected dir has none.
+	const fallback = join(homedir(), CONFIG_DIR_NAME, "agent", "claude-bridge.json");
+	return existsSync(fallback) ? fallback : path;
 }
 
 export function loadConfig(): Config {

@@ -30,13 +30,13 @@ import { randomUUID } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { createSession, deleteSession, getProjectDir, openSession, repairToolPairing } from "cc-session-io";
+import { createSession, deleteSession, getProjectDir, getSessionPath, openSession, repairToolPairing } from "cc-session-io";
 
 const CWD = process.cwd();
 const MODEL = "claude-haiku-5-5";
@@ -481,6 +481,50 @@ test("repairToolPairing keeps every result only when they share one user message
 	assert.deepEqual(single, ["RESULT-t1", "RESULT-t2", "RESULT-t3"]);
 	assert.ok(split.some((content) => !String(content).startsWith("RESULT-")),
 		`repairToolPairing now tolerates split results (${JSON.stringify(split)}) — convertPiMessages could stop collecting them`);
+});
+
+// --- Environment ---
+
+test("options.env CLAUDE_CONFIG_DIR is honored per query", { timeout: 120_000 }, async () => {
+	// Multi-account support passes a different CLAUDE_CONFIG_DIR per model via
+	// options.env. Valid only if each query() child reads the var itself at
+	// spawn — no SDK-side caching across queries. The var selects the config
+	// dir AND the credential-store entry (macOS keychain service name is
+	// derived from it), so the outcome differs by auth method; either branch
+	// proves the child honored the per-query value.
+	const freshDir = mkdtempSync(join(tmpdir(), "cc-config-dir-"));
+	try {
+		let init = null;
+		let failure = null;
+		try {
+			for await (const message of query({
+				prompt: "Reply with exactly: ok",
+				options: {
+					cwd: CWD, model: MODEL, tools: [], permissionMode: "bypassPermissions", maxTurns: 1,
+					env: { ...process.env, CLAUDE_CONFIG_DIR: freshDir },
+				},
+			})) {
+				if (message.type === "system" && message.subtype === "init") init = message;
+				if (message.type === "result" && (message.is_error || message.subtype !== "success")) failure = JSON.stringify(message.result ?? message.subtype);
+			}
+		} catch (error) {
+			failure = String(error);
+		}
+		if (failure !== null) {
+			// Subscription auth: the fresh dir derives an empty credential entry,
+			// so the child not being logged in is itself the proof.
+			assert.match(failure, /log ?in/i,
+				`query with a fresh CLAUDE_CONFIG_DIR failed for an unrelated reason: ${failure}`);
+		} else {
+			// API-key auth succeeds regardless of the credential store; the
+			// transcript landing under the fresh dir is the proof instead.
+			assert.ok(init?.session_id, "no init message seen");
+			assert.ok(existsSync(getSessionPath(init.session_id, CWD, freshDir)),
+				"the session transcript did not land under the per-query CLAUDE_CONFIG_DIR");
+		}
+	} finally {
+		rmSync(freshDir, { recursive: true, force: true });
+	}
 });
 
 // --- Environment suppression ---

@@ -69,6 +69,27 @@ describe("loadConfig", () => {
 			rmSync(agentDir, { recursive: true, force: true });
 		}
 	}));
+
+	it("falls back to the default global config when the PI_CODING_AGENT_DIR dir has none", () => withTempHome((home) => {
+		const agentDir = mkdtempSync(join(tmpdir(), "claude-bridge-agent-"));
+		const oldEnv = process.env.PI_CODING_AGENT_DIR;
+		try {
+			const defaultDir = join(home, ".pi", "agent");
+			mkdirSync(defaultDir, { recursive: true });
+			writeFileSync(join(defaultDir, "claude-bridge.json"), JSON.stringify({
+				provider: { accounts: { work: { configDir: "~/.claude-work" } } },
+			}));
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+
+			assert.deepEqual(loadConfig().provider, {
+				accounts: { work: { configDir: "~/.claude-work" } },
+			});
+		} finally {
+			if (oldEnv === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = oldEnv;
+			rmSync(agentDir, { recursive: true, force: true });
+		}
+	}));
 });
 
 describe("the old askClaude setting", () => {

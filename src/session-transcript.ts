@@ -16,8 +16,8 @@ const chainEntry = (record: RecordEntry): boolean => ["user", "assistant", "atta
 /** A record is committed by its terminating newline. Every terminated line
  * parses strictly; only an unterminated final line that fails to parse is an
  * append a crash cut short, and is not part of the transcript. */
-export function readTranscript(state: Pick<SessionState, "ccSessionId" | "cwd">): RecordEntry[] {
-	const text = readFileSync(getSessionPath(state.ccSessionId, state.cwd, process.env.CLAUDE_CONFIG_DIR), "utf8");
+export function readTranscript(state: Pick<SessionState, "ccSessionId" | "cwd">, claudeDir: string | undefined = process.env.CLAUDE_CONFIG_DIR): RecordEntry[] {
+	const text = readFileSync(getSessionPath(state.ccSessionId, state.cwd, claudeDir), "utf8");
 	const end = text.lastIndexOf("\n") + 1;
 	const records = parseJsonl(text.slice(0, end));
 	if (text.slice(end).trim()) {

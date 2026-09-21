@@ -6,6 +6,7 @@ import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/res
 import { createSession, deleteSession, getSessionPath } from "cc-session-io";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
+import { homedir } from "os";
 import { dirname } from "path";
 import { PROVIDER_ID, messageContentToText } from "./convert.js";
 import { QueryProcess } from "./query-process.js";
@@ -58,6 +59,74 @@ const ACTIVE_STREAM_SIMPLE_KEY = Symbol.for("claude-bridge:activeStreamSimple");
 const MODELS = buildModels(getModels("anthropic"));
 let providerSettings: NonNullable<Config["provider"]> = {};
 let longContextSettings: LongContextSettings = { plan: "pro", longContextExtraUsage: false };
+
+// Each registered provider maps to one Claude subscription. The default account
+// preserves the existing CLAUDE_CONFIG_DIR behavior; named accounts carry an
+// explicit config directory and per-account long-context settings.
+type Account = {
+	providerId: string;
+	label?: string;
+	claudeDir?: string;
+	longContext: LongContextSettings;
+};
+
+let defaultAccount: Account = { providerId: PROVIDER_ID, longContext: longContextSettings };
+let accountsById = new Map<string, Account>([[PROVIDER_ID, defaultAccount]]);
+
+function accountFor(providerId: string | undefined): Account {
+	return (providerId !== undefined ? accountsById.get(providerId) : undefined) ?? defaultAccount;
+}
+
+function claudeDirFor(account: Account): string | undefined {
+	return account.claudeDir ?? process.env.CLAUDE_CONFIG_DIR;
+}
+
+/** ccChildEnv for `account`. Its config dir is set after: ccChildEnv refuses one from
+ *  a caller, since the bridge has to read session files where the child writes them,
+ *  and for an account both sides take it from the account. */
+function childEnvFor(account: Account, overrides?: Record<string, string>): NodeJS.ProcessEnv {
+	const env = ccChildEnv(overrides);
+	if (account.claudeDir) env.CLAUDE_CONFIG_DIR = account.claudeDir;
+	return env;
+}
+
+function configureAccounts(provider: NonNullable<Config["provider"]>): void {
+	// Opus 4.6 and Sonnet 4.6 need these settings to know if they're eligible for 1M context
+	// Validate at the boundary: a non-array here would throw inside every
+	// claudeCodeModelId call and brick the extension at activation.
+	const forceTwoHundredK = Array.isArray(provider.forceTwoHundredK)
+		? provider.forceTwoHundredK.filter((id): id is string => typeof id === "string")
+		: undefined;
+	longContextSettings = {
+		plan: provider.plan ?? "pro",
+		longContextExtraUsage: provider.longContextExtraUsage ?? false,
+		forceTwoHundredK,
+	};
+	const defaultName = provider.defaultAccountName?.trim();
+	defaultAccount = {
+		providerId: defaultName ? `${PROVIDER_ID}-${defaultName}` : PROVIDER_ID,
+		...(defaultName ? { label: defaultName } : {}),
+		longContext: longContextSettings,
+	};
+	accountsById = new Map([[defaultAccount.providerId, defaultAccount]]);
+	for (const [name, acct] of Object.entries(provider.accounts ?? {})) {
+		if (!acct?.configDir) {
+			console.error(`claude-bridge: provider.accounts.${name} has no configDir; skipping`);
+			continue;
+		}
+		const providerId = `${PROVIDER_ID}-${name}`;
+		accountsById.set(providerId, {
+			providerId,
+			label: name,
+			claudeDir: acct.configDir.replace(/^~(?=$|\/)/, homedir()),
+			longContext: {
+				plan: acct.plan ?? "pro",
+				longContextExtraUsage: acct.longContextExtraUsage ?? false,
+				forceTwoHundredK,
+			},
+		});
+	}
+}
 
 // --- Session persistence ---
 
@@ -393,7 +462,8 @@ async function runIsolatedSummary(
 		if (!promptText) throw new Error("runIsolatedSummary: one-off summary without a user prompt (last message is not user?)");
 		const cwd = sessionCwdFor(summarySessionFor(options?.signal) ?? options?.sessionId);
 		const claudeExecutable = providerSettings.pathToClaudeCodeExecutable;
-		const cliModel = claudeCodeModelId(model, longContextSettings);
+		const account = accountFor((model as { provider?: string }).provider);
+		const cliModel = claudeCodeModelId(model, account.longContext);
 		// Honour the caller's reasoning level, same mapping as the provider path.
 		const effort = effortForReasoning(model, options?.reasoning);
 		const thinking = thinkingForReasoning(model, options?.reasoning);
@@ -403,7 +473,7 @@ async function runIsolatedSummary(
 			prompt: promptText,
 			options: {
 				cwd,
-				env: traceQueryStart(traceQueryId, { kind: "isolated-summary", callId: traceCallId, model: cliModel }, ccChildEnv(options?.env)),
+				env: traceQueryStart(traceQueryId, { kind: "isolated-summary", callId: traceCallId, model: cliModel }, childEnvFor(account, options?.env)),
 				settings: { autoMemoryEnabled: false },
 				tools: [],
 				strictMcpConfig: true,
@@ -523,18 +593,19 @@ function verifyWrittenSession(
 	expectedSessionId: string,
 	expectedRecordCount: number,
 	cwd: string,
+	claudeDir?: string,
 ): void {
 	const warnings = _verifyWrittenSession(jsonlPath, expectedSessionId, expectedRecordCount);
 	for (const msg of warnings) {
 		debug(`WARNING session verify: ${msg}`);
 		piUI?.notify(
 			`Session file issue: ${msg}\n` +
-			`cwd=${cwd} realpath=${safeRealpath(cwd)} CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR ?? "(unset)"}\n` +
+			`cwd=${cwd} realpath=${safeRealpath(cwd)} CLAUDE_CONFIG_DIR=${claudeDir ?? process.env.CLAUDE_CONFIG_DIR ?? "(unset)"}\n` +
 			`Please copy and paste this message into a new issue at https://github.com/elidickinson/pi-claude-bridge/issues/new` +
 			(DEBUG ? ` and attach ${debugLogPath()}` : ` (rerun with CLAUDE_BRIDGE_DEBUG=1 to capture a debug log)`),
 			"warning",
 		);
-		diagDump("session_verify_fail", { msg, jsonlPath, cwd, realpath: safeRealpath(cwd), claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null });
+		diagDump("session_verify_fail", { msg, jsonlPath, cwd, realpath: safeRealpath(cwd), claudeConfigDir: claudeDir ?? process.env.CLAUDE_CONFIG_DIR ?? null });
 	}
 }
 
@@ -573,7 +644,12 @@ function syncSharedSession(
 	piSessionId: string | null,
 	traceCallId: string | undefined,
 	promptDigest: string,
+	account: Account = defaultAccount,
 ): SyncResult {
+	// A mirror written under another account sits in that account's config dir, so
+	// here it reads as a missing transcript and pi's history is imported afresh:
+	// a provider switch never resumes another account's session.
+	const claudeDir = claudeDirFor(account);
 	let state = sessionStateFor(piSessionId);
 	const before = state;
 	const history = nonSystemMessages(messages);
@@ -581,7 +657,7 @@ function syncSharedSession(
 	const compared = state ? compareHistory(digestMessages(priors), state) : { commonPrefix: 0, cutCount: 0, equal: false };
 	let missingFile = false;
 	if (state) {
-		try { statSync(getSessionPath(state.ccSessionId, state.cwd, process.env.CLAUDE_CONFIG_DIR)); }
+		try { statSync(getSessionPath(state.ccSessionId, state.cwd, claudeDir)); }
 		catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 			missingFile = true;
@@ -614,12 +690,12 @@ function syncSharedSession(
 		return { sessionId: state!.ccSessionId, targetSessionId: state!.ccSessionId, created: false, recorded: copyRecording(state!), state };
 	}
 	if (state) traceSnapshot({ callId: traceCallId, ccSession: state.ccSessionId, cwd: state.cwd, reason: "rebuild-rotate", writer: "no-known-writer" }, true);
-	const session = createSession({ projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR, model: modelId });
+	const session = createSession({ projectPath: cwd, claudeDir, model: modelId });
 	const targetSessionId = session.sessionId;
 	let recorded: Recording;
 	let records = 0;
 	if (row === 6 || row === 7) {
-		const transcript = readTranscript(state!);
+		const transcript = readTranscript(state!, claudeDir);
 		const cut = resolveRecordingCut(transcript, state!, compared.cutCount);
 		recorded = prefixRecording(state!, compared.cutCount);
 		if (row === 6) {
@@ -628,18 +704,18 @@ function syncSharedSession(
 		}
 		const rest = priors.slice(compared.cutCount);
 		const replaced = transcript.slice(cut.index + 1);
-		const suffix = importHistory(session, rest, customToolNameToSdk, collectCarriedAttachments(replaced), recordedToolResults(replaced, state!.digests, rest));
+		const suffix = importHistory(session, rest, customToolNameToSdk, collectCarriedAttachments(replaced), recordedToolResults(replaced, state!.digests, rest), account.providerId);
 		recorded = { digests: [...recorded.digests, ...suffix.digests], uuids: [...recorded.uuids, ...suffix.uuids], cuttable: [...recorded.cuttable, ...suffix.cuttable] };
 		records = savePrefixSession(session, transcript.slice(0, cut.index + 1), cut.uuid);
 	} else {
 		// Nothing is kept, but the old transcript's @file expansions and tool results
 		// still belong to messages pi kept unchanged.
-		const transcript = state ? readTranscript(state) : [];
-		recorded = importHistory(session, priors, customToolNameToSdk, collectCarriedAttachments(transcript), recordedToolResults(transcript, state?.digests ?? [], priors));
+		const transcript = state ? readTranscript(state, claudeDir) : [];
+		recorded = importHistory(session, priors, customToolNameToSdk, collectCarriedAttachments(transcript), recordedToolResults(transcript, state?.digests ?? [], priors), account.providerId);
 		session.save();
 		records = session.records.length;
 	}
-	if (records) verifyWrittenSession(session.jsonlPath, targetSessionId, records, cwd);
+	if (records) verifyWrittenSession(session.jsonlPath, targetSessionId, records, cwd, claudeDir);
 	decision(row === 7 ? "prefix-write" : records ? "rebuild" : "clean-start", targetSessionId);
 	traceEvent("rebuild-written", { callId: traceCallId, piSessionId: piSessionId ?? null, ccSessionAfter: targetSessionId, records });
 	debugSessionPaths(targetSessionId.slice(0, 8), cwd, session.jsonlPath);
@@ -700,6 +776,9 @@ export const __test = {
 	effortForReasoning,
 	thinkingForReasoning,
 	syncSharedSession,
+	configureAccounts,
+	accountFor,
+	childEnvFor,
 	extractUserPromptBlocks,
 	consumeQuery,
 	finalizeCurrentStream,
@@ -1450,7 +1529,7 @@ async function consumeQuery(
 				if (queryCtx.rateLimitRejection) {
 					resultError = describeRateLimitFailure(queryCtx.rateLimitRejection, resultError);
 					queryCtx.rateLimitRejection = null;
-				} else if (resultError.includes("out of extra usage") && !extraUsageByChoice(model, longContextSettings)) {
+				} else if (resultError.includes("out of extra usage") && !extraUsageByChoice(model, accountFor(model.provider).longContext)) {
 					// Extra Usage off or empty, and no plan window was rejected first.
 					resultError += ` (${THIRD_PARTY_SUSPECT})`;
 				}
@@ -1475,7 +1554,7 @@ async function consumeQuery(
 			// CC sets isUsingOverage only when a rejected plan window is served from Extra
 			// Usage; overageInUse alone means the request was billed there anyway.
 			if (info?.overageInUse === true && info.status !== "rejected" && info.isUsingOverage !== true
-				&& !extraUsageByChoice(model, longContextSettings) && !queryCtx.warnedUnplannedOverage) {
+				&& !extraUsageByChoice(model, accountFor(model.provider).longContext) && !queryCtx.warnedUnplannedOverage) {
 				queryCtx.warnedUnplannedOverage = true;
 				piUI?.notify(`Claude Code request billed to Extra Usage: ${THIRD_PARTY_SUSPECT}, or this model needs usage credits on your plan`, "warning");
 			}
@@ -1864,6 +1943,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	queryCtx.piSessionId = options?.sessionId ?? null;
 	queryCtx.resetTurnState(model);
+	const account = accountFor((model as { provider?: string }).provider);
 	claimCurrentPiStream(stream, "fresh-query", queryCtx, options);
 	activeQueryContexts.add(queryCtx);
 	let createdBeforeLaunch: { id: string; cwd: string } | undefined;
@@ -1876,7 +1956,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		const cwd = sessionCwdFor(options?.sessionId);
 		// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
 		// pi-registered id. Log cliModel so debug lines reflect what CC actually received.
-		const cliModel = claudeCodeModelId(model, longContextSettings);
+		const cliModel = claudeCodeModelId(model, account.longContext);
 		// Which pi session this query serves — the attribution key for history
 		// rewrites (session_compact / session_tree) and for SessionState above.
 		const piSessionId = options?.sessionId ?? null;
@@ -1884,7 +1964,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// after compaction), the session's mark is the only sign of the rewrite.
 		const historyRewritten = rewrittenUnderQuery || (piSessionId !== null && historyRewrittenBySession.has(piSessionId));
 		const promptDigest = createHash("sha256").update(systemPromptAppend ?? "").digest("hex");
-		const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, piSessionId, traceCallId, promptDigest);
+		const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, piSessionId, traceCallId, promptDigest, account);
 		if (syncResult.created) createdBeforeLaunch = { id: syncResult.targetSessionId, cwd };
 		// This query starts from the history pi has now: consume this session's
 		// armed rewrite — a sibling pi session's stays armed for its own queries.
@@ -1973,7 +2053,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			kind: "provider", callId: traceCallId, piSessionId, reentrant: isReentrant, resume: resumeSessionId ?? null,
 			model: cliModel, effort: effort ?? null, servedToolNames: Object.fromEntries(customToolNameToSdk), mcpTools: mcpTools.map((t) => t.name),
 			signal: traceSignalId(options?.signal), digests: { systemPromptAppend },
-		}, ccChildEnv(options?.env));
+		}, childEnvFor(account, options?.env));
 		const cliDebug = makeCliDebugOptions("provider");
 		const childProcess = new QueryProcess(cliDebug.stderr);
 		const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
@@ -2186,13 +2266,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				stopWriting();
 				try { await persistRecording(); }
 				finally {
-					if (syncResult.created && !recording.hasProgress) deleteSession(syncResult.targetSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
+					if (syncResult.created && !recording.hasProgress) deleteSession(syncResult.targetSessionId, cwd, claudeDirFor(account));
 					releaseWriter();
 				}
 			});
 
 	})().catch((error) => {
-		if (createdBeforeLaunch) deleteSession(createdBeforeLaunch.id, createdBeforeLaunch.cwd, process.env.CLAUDE_CONFIG_DIR);
+		if (createdBeforeLaunch) deleteSession(createdBeforeLaunch.id, createdBeforeLaunch.cwd, claudeDirFor(account));
 		queryCtx.promptStream?.fail(error instanceof Error ? error : new Error(errorMessage(error)));
 		queryCtx.promptStream = null;
 		if (queryCtx.discarded) return;
@@ -2211,18 +2291,8 @@ export default function (pi: ExtensionAPI) {
 	debug(`bridge: version=${BRIDGE_VERSION} sdk=${packageVersion("@anthropic-ai/claude-agent-sdk")} pi=${PI_VERSION}`);
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
-	// Opus 4.6 and Sonnet 4.6 need these settings to know if they're eligible for 1M context
-	// Validate at the boundary: a non-array here would throw inside every
-	// claudeCodeModelId call and brick the extension at activation.
-	const forceTwoHundredK = Array.isArray(providerSettings.forceTwoHundredK)
-		? providerSettings.forceTwoHundredK.filter((id): id is string => typeof id === "string")
-		: undefined;
-	longContextSettings = {
-		plan: providerSettings.plan ?? "pro",
-		longContextExtraUsage: providerSettings.longContextExtraUsage ?? false,
-		forceTwoHundredK,
-	};
-	const registeredModels = applyLongContext(MODELS, longContextSettings);
+	configureAccounts(providerSettings);
+	const registeredModels = applyLongContext(MODELS, defaultAccount.longContext);
 	if (registeredModels.length === 0) {
 		console.error("claude-bridge: no models available from pi-ai's anthropic catalog — update @earendil-works/pi-ai (requires >=1.5.1)");
 	}
@@ -2353,7 +2423,7 @@ export default function (pi: ExtensionAPI) {
 	// pi's history keeps the arguments CC sent and a rebuild matches CC's records (#203).
 	// A `background: true` call (added by an extension) doesn't block the turn, so it gets no default.
 	pi.on("tool_call", (event, ctx) => {
-		if (isToolCallEventType("bash", event) && event.input.timeout == null && ctx.model?.provider === PROVIDER_ID
+		if (isToolCallEventType("bash", event) && event.input.timeout == null && ctx.model !== undefined && accountsById.has(ctx.model.provider)
 			&& (event.input as { background?: unknown }).background !== true) {
 			event.input.timeout = 120;
 		}
@@ -2395,20 +2465,24 @@ export default function (pi: ExtensionAPI) {
 		// Context models (toBridgeContext normalizes at the stream entry points).
 		streamSimple: streamClaudeAgentSdk as any,
 	};
+	const registerAccount = (account: Account) => pi.registerProvider(account.providerId, {
+		...(account.label ? { name: `Claude Code (${account.label})` } : {}),
+		...providerConfig,
+		models: applyLongContext(MODELS, account.longContext),
+	});
 	if (!g[ACTIVE_STREAM_SIMPLE_KEY]) {
 		// First instance: store our streamSimple and register.
 		g[ACTIVE_STREAM_SIMPLE_KEY] = streamClaudeAgentSdk;
-		pi.registerProvider(PROVIDER_ID, providerConfig);
+		for (const account of accountsById.values()) registerAccount(account);
 	} else {
 		// Later instance: register only if this session's registry lacks the provider.
 		debug(`provider: deferring registration decision to session_start (module=${moduleInstanceId})`);
 		pi.on("session_start", (_event, ctx) => {
-			if (ctx.modelRegistry.getProvider(PROVIDER_ID)) {
-				debug(`provider: registry already has ${PROVIDER_ID}, skipping registration (module=${moduleInstanceId})`);
-				return;
+			for (const account of accountsById.values()) {
+				if (ctx.modelRegistry.getProvider(account.providerId)) continue;
+				debug(`provider: registry lacks ${account.providerId}, registering (module=${moduleInstanceId})`);
+				registerAccount(account);
 			}
-			debug(`provider: registry lacks ${PROVIDER_ID}, registering (module=${moduleInstanceId})`);
-			pi.registerProvider(PROVIDER_ID, providerConfig);
 		});
 	}
 }

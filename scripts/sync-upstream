@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+if [[ -n "$(git status --short)" ]]; then
+  echo "sync-upstream: worktree is dirty; commit or stash changes first" >&2
+  exit 1
+fi
+
+source_branch=$(git branch --show-current)
+if [[ -z "$source_branch" ]]; then
+  echo "sync-upstream: detached HEAD; run from the fork's main branch" >&2
+  exit 1
+fi
+
+upstream_remote=${UPSTREAM_REMOTE:-upstream}
+# Keep upstream's release refs separate while selecting the newest stable tag, so
+# a fork-only/local semver tag cannot be mistaken for an upstream release.
+git fetch "$upstream_remote" "+refs/tags/v*:refs/upstream-release-tags/v*"
+release=$(git for-each-ref --sort=-version:refname --format='%(refname:strip=2)' refs/upstream-release-tags \
+  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+if [[ -z "$release" ]]; then
+  echo "sync-upstream: no stable upstream release tag found" >&2
+  exit 1
+fi
+git fetch "$upstream_remote" "refs/tags/$release:refs/tags/$release"
+
+baseline=$(cat .upstream-release 2>/dev/null || true)
+old_head=$(git rev-parse HEAD)
+if [[ -z "$baseline" ]] || ! git rev-parse --verify "$baseline^{commit}" >/dev/null 2>&1; then
+  echo "sync-upstream: .upstream-release must name an existing tag/commit" >&2
+  exit 1
+fi
+if ! git merge-base --is-ancestor "$baseline" "$old_head"; then
+  echo "sync-upstream: $baseline is not an ancestor of HEAD; refusing to replay an unrelated history" >&2
+  exit 1
+fi
+if [[ "$baseline" == "$release" ]]; then
+  echo "upstream is already synchronized at $release"
+  exit 0
+fi
+
+expected_branch=${FORK_SOURCE_BRANCH:-main}
+if [[ "$source_branch" != "$expected_branch" ]]; then
+  echo "sync-upstream: run from $expected_branch (currently $source_branch)" >&2
+  exit 1
+fi
+if [[ -n "$(git rev-list --merges "$baseline..$old_head")" ]]; then
+  echo "sync-upstream: fork stack contains merge commits; expected a linear patch stack" >&2
+  exit 1
+fi
+
+mapfile -t custom_commits < <(git rev-list --reverse "$baseline..$old_head")
+if ((${#custom_commits[@]} == 0)); then
+  echo "sync-upstream: no fork commits found after $baseline" >&2
+  exit 1
+fi
+
+branch="sync/upstream-${release#v}"
+if git show-ref --verify --quiet "refs/heads/$branch"; then
+  echo "sync-upstream: branch $branch already exists; remove it or choose another worktree" >&2
+  exit 1
+fi
+archive_tag="archive/pre-upstream-${release}-${old_head:0:12}"
+if git show-ref --verify --quiet "refs/tags/$archive_tag"; then
+  echo "sync-upstream: archive tag $archive_tag already exists" >&2
+  exit 1
+fi
+git tag "$archive_tag" "$old_head"
+
+git switch -c "$branch" "$release"
+for commit in "${custom_commits[@]}"; do
+  git cherry-pick "$commit" || {
+    echo "sync-upstream: conflict while applying $commit; resolve manually, then run git cherry-pick --continue" >&2
+    echo "sync-upstream: recoverable source tip is tagged $archive_tag" >&2
+    exit 1
+  }
+done
+
+printf '%s\n' "$release" > .upstream-release
+git add .upstream-release
+if ! git diff --cached --quiet; then
+  git commit -m "Track upstream $release"
+fi
+
+echo "Created $branch on $release and archived the source tip as $archive_tag."
+echo "Review conflicts and git diff $release..HEAD; no push or deployment was performed."

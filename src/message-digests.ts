@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Message as PiMessage } from "@earendil-works/pi-ai";
-import { messageContentToText, PROVIDER_ID } from "./convert.js";
+import { isBridgeProvider, messageContentToText } from "./convert.js";
 
 function writeString(hash: ReturnType<typeof createHash>, value: string): void {
 	hash.update(`s${value.length}:`);
@@ -50,7 +50,7 @@ function isReplayableThinking(
 	message: Extract<PiMessage, { role: "assistant" }>,
 	block: AssistantContent,
 ): block is Extract<AssistantContent, { type: "thinking" }> {
-	return block.type === "thinking" && message.provider === PROVIDER_ID && !!block.thinkingSignature;
+	return block.type === "thinking" && isBridgeProvider(message.provider) && !!block.thinkingSignature;
 }
 
 function writeUser(hash: ReturnType<typeof createHash>, message: Extract<PiMessage, { role: "user" }>): void {

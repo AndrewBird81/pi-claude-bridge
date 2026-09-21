@@ -7,6 +7,11 @@ import { MCP_TOOL_PREFIX } from "./skills.js";
 
 export const PROVIDER_ID = "claude-bridge";
 
+/** The default account's provider, or a named account's ("claude-bridge-<name>"). */
+export function isBridgeProvider(provider: string | undefined): boolean {
+	return provider === PROVIDER_ID || Boolean(provider?.startsWith(`${PROVIDER_ID}-`));
+}
+
 export function sanitizeToolId(id: string, cache: Map<string, string>): string {
 	const existing = cache.get(id);
 	if (existing) return existing;
@@ -96,6 +101,8 @@ export function convertPiMessages(
 	messages: PiMessage[],
 	customToolNameToSdk: ReadonlyMap<string, string> = new Map(),
 	recorded: ReadonlyMap<string, ToolResultBlock> = new Map(),
+	/** The account whose session this history is being imported into. */
+	providerId: string = PROVIDER_ID,
 ): { anthropicMessages: SessionMessage[]; sanitizedIds: Map<string, string>; origins: number[][] } {
 	const anthropicMessages: SessionMessage[] = [];
 	const sources = new Map<SessionMessage, number[]>();
@@ -133,11 +140,12 @@ export function convertPiMessages(
 				if (block.type === "text" && block.text) {
 					blocks.push({ type: "text", text: block.text });
 				} else if (block.type === "thinking") {
-					// Only replay thinking Claude Code itself produced. A signature minted
-					// by any other provider — including pi's own Anthropic provider — is
-					// not ours to hand back, and Anthropic rejects ones it can't verify.
+					// Only replay thinking this account's Claude Code produced. A signature
+					// minted by any other provider — including pi's own Anthropic provider,
+					// or another claude-bridge account — is not ours to hand back, and
+					// Anthropic rejects ones it can't verify.
 					const sig = block.thinkingSignature;
-					if (msg.provider === PROVIDER_ID && sig) {
+					if (msg.provider === providerId && sig) {
 						blocks.push({ type: "thinking", thinking: block.thinking ?? "", signature: sig });
 					}
 				} else if (block.type === "toolCall") {

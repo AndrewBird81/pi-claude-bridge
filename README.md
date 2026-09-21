@@ -61,6 +61,8 @@ Create `~/.pi/agent/claude-bridge.json`
 }
 ```
 
+When the agent dir is redirected (`PI_CODING_AGENT_DIR`, e.g. a host-managed per-session dir) and has no `claude-bridge.json`, the default `~/.pi/agent/claude-bridge.json` is read instead — accounts and provider settings belong to the user, not the sandbox.
+
 ### Provider options
 
 - `strictMcpConfig` - block MCP servers from `~/.claude.json` / `.mcp.json` (default `true`). Cloud MCP (Gmail/Drive via claude.ai OAuth) is always blocked.
@@ -69,6 +71,48 @@ Create `~/.pi/agent/claude-bridge.json`
 - `forceTwoHundredK` - array of model ids to pin to 200K context (bare id, no `[1m]` suffix). Use if pi-ai declares a model at 1M but Claude Code won't serve it on your plan.
 - `plan` - set to `"max"` on a Max (or Team Premium/Enterprise) plan to run Opus 4.6 with 1M context (default `"pro"`).
 - `longContextExtraUsage` - set to `true` to run Opus 4.6 (on Pro) and Sonnet 4.6 with 1M context, billed through Extra Usage.
+- `accounts` - additional Claude subscriptions, each shown as its own provider in the model picker (see below).
+- `defaultAccountName` - name the default account so it registers as `claude-bridge-<name>` instead of bare `claude-bridge` (see below).
+
+### Multiple Claude accounts
+
+To use a second Claude subscription (say, work and personal) in the same pi session:
+
+```json
+{
+  "provider": {
+    "plan": "pro",
+    "accounts": {
+      "work": { "configDir": "~/.claude-work", "plan": "max" }
+    }
+  }
+}
+```
+
+Each entry registers a provider `claude-bridge-<name>` ("Claude Code (<name>)" in the picker) whose queries run against that account's `configDir` — its own settings *and* its own credentials, since Claude Code derives the credential-store entry from `CLAUDE_CONFIG_DIR`. The top-level `plan`/`longContextExtraUsage` stay with the default account; each entry takes its own.
+
+Log the account in once, interactively:
+
+```sh
+CLAUDE_CONFIG_DIR=~/.claude-work claude auth login
+```
+
+Switching accounts mid-session works; the switch imports pi's history into a new Claude Code session under the other account (one prompt-cache miss, same as switching to any other provider). The opt-in cache trace (`CLAUDE_BRIDGE_TRACE_DIR`) snapshots session files from the default account's config dir only.
+
+The default account stays bare `claude-bridge`, which reads oddly next to a named one. `defaultAccountName` names it too:
+
+```json
+{
+  "provider": {
+    "defaultAccountName": "personal",
+    "accounts": {
+      "work": { "configDir": "~/.claude-work", "plan": "max" }
+    }
+  }
+}
+```
+
+That registers `claude-bridge-personal` and `claude-bridge-work` and nothing bare. The default account still takes its config dir from `CLAUDE_CONFIG_DIR` (or Claude Code's default) — only the provider name changes. Because the name is part of every model ID, update pi's `enabledModels` (and any pinned `defaultProvider`/`defaultModel`) to match; sessions already pinned to a `claude-bridge/…` model will not resolve until repointed.
 
 ### Model overrides
 
