@@ -7,7 +7,7 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { applyLongContext, buildModels, claudeCodeModelId, resolveClaudeCodeRuntimeModel, resolveModel } from "../src/models.js";
+import { applyLongContext, buildModels, CLAUDE_CODE_MODEL_FALLBACKS, claudeCodeModelId, resolveClaudeCodeRuntimeModel, resolveModel } from "../src/models.js";
 import { getModels } from "@earendil-works/pi-ai/compat";
 
 const PRO = { plan: "pro", longContextExtraUsage: false };
@@ -28,10 +28,11 @@ const mockPiAiModel = (id, extra = {}) => ({
 const oneM = (id) => mockPiAiModel(id, { contextWindow: 1000000 });
 
 const find = (models, id) => models.find((m) => m.id === id);
+const currentModels = () => buildModels([...getModels("anthropic"), ...CLAUDE_CODE_MODEL_FALLBACKS]);
 
 describe("MODELS projection", () => {
-	it("driven by pi-ai's real anthropic catalog, minus dated snapshot aliases", () => {
-		const models = buildModels(getModels("anthropic"));
+	it("combines pi-ai's catalog with Claude Code-ahead fallbacks, minus aliases and duplicates", () => {
+		const models = currentModels();
 		for (const m of models) {
 			assert.doesNotMatch(m.id, /-20\d{6}$/, "no dated snapshot ids in the picker");
 			assert.equal(m.baseUrl, undefined);
@@ -40,10 +41,20 @@ describe("MODELS projection", () => {
 			assert.equal(m.headers, undefined);
 			assert.deepEqual(m.cost, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 		}
-		// Spot-check coverage of every current family.
+		// Spot-check coverage of every current family and the ahead-of-pi-ai fallback.
+		assert.ok(find(models, "claude-opus-5-5"), "opus-5-5 present");
 		assert.ok(find(models, "claude-opus-5"), "opus-5 present");
 		assert.ok(find(models, "claude-fable-5-1"), "fable-5-1 present");
 		assert.ok(find(models, "claude-haiku-4-5"), "haiku present");
+	});
+
+	it("prefers pi-ai metadata when a fallback id is duplicated", () => {
+		const models = buildModels([
+			mockPiAiModel("claude-opus-5-5", { name: "Catalog name" }),
+			...CLAUDE_CODE_MODEL_FALLBACKS,
+		]);
+		assert.equal(models.filter((m) => m.id === "claude-opus-5-5").length, 1);
+		assert.equal(find(models, "claude-opus-5-5").name, "Catalog name");
 	});
 
 	it("sorts newest generation first within each family", () => {
@@ -78,10 +89,10 @@ describe("MODELS projection", () => {
 });
 
 describe("resolveModel", () => {
-	const models = buildModels(getModels("anthropic"));
+	const models = currentModels();
 
-	it("opus shortcut resolves to claude-opus-5 (newest opus)", () => {
-		assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5");
+	it("opus shortcut resolves to claude-opus-5-5 (newest opus)", () => {
+		assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5-5");
 	});
 
 	it("exact id beats newer partial match (claude-fable-5 → fable-5, not 5-1)", () => {
@@ -91,7 +102,7 @@ describe("resolveModel", () => {
 
 describe("Claude Code runtime policy", () => {
 	it("measured-1M ids send [1m] on every plan", () => {
-		for (const id of ["claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-fable-5", "claude-fable-5-1", "claude-sonnet-5"]) {
+		for (const id of ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-fable-5", "claude-fable-5-1", "claude-sonnet-5"]) {
 			assert.deepEqual(resolveClaudeCodeRuntimeModel(oneM(id), PRO), { cliModelId: `${id}[1m]`, contextWindow: 1000000 });
 		}
 	});
@@ -129,6 +140,7 @@ describe("Claude Code runtime policy", () => {
 
 describe("claudeCodeModelId", () => {
 	it("returns the measured SDK request id", () => {
+		assert.equal(claudeCodeModelId({ id: "claude-opus-5-5", contextWindow: 1000000 }, PRO), "claude-opus-5-5[1m]");
 		assert.equal(claudeCodeModelId({ id: "claude-opus-5", contextWindow: 1000000 }, PRO), "claude-opus-5[1m]");
 		assert.equal(claudeCodeModelId({ id: "claude-opus-4-7", contextWindow: 1000000 }, PRO), "claude-opus-4-7[1m]");
 		assert.equal(claudeCodeModelId({ id: "claude-haiku-4-5", contextWindow: 200000 }, PRO), "claude-haiku-4-5");
@@ -136,10 +148,11 @@ describe("claudeCodeModelId", () => {
 });
 
 describe("applyLongContext", () => {
-	const models = buildModels(getModels("anthropic"));
+	const models = currentModels();
 
 	it("registers 1M for measured-1M models", () => {
 		const registered = applyLongContext(models, PRO);
+		assert.equal(find(registered, "claude-opus-5-5").contextWindow, 1000000);
 		assert.equal(find(registered, "claude-opus-5").contextWindow, 1000000);
 		assert.equal(find(registered, "claude-opus-4-7").contextWindow, 1000000);
 		assert.equal(find(registered, "claude-fable-5-1").contextWindow, 1000000);
@@ -173,6 +186,7 @@ describe("applyLongContext", () => {
 
 	it("labels exactly the registered 1M models", () => {
 		const pro = applyLongContext(models, PRO);
+		assert.equal(find(pro, "claude-opus-5-5").name, "Claude Opus 5.5 1M");
 		assert.equal(find(pro, "claude-opus-5").name, "Claude Opus 5 1M");
 		assert.equal(find(pro, "claude-opus-4-6").name, "Claude Opus 4.6");
 		assert.equal(find(pro, "claude-haiku-4-5").name, "Claude Haiku 4.5 (latest)");

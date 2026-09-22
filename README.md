@@ -25,13 +25,13 @@ Requires pi 0.85.0 or newer (`pi-ai`, `pi-coding-agent`, `pi-tui`); pi 0.86 need
 
 ## Provider
 
-Use `/model` to select any Claude model in pi-ai's catalog, e.g. `claude-bridge/claude-fable-5-1`, `claude-bridge/claude-opus-5`, or `claude-bridge/claude-haiku-4-5`.
+Use `/model` to select a Claude model, e.g. `claude-bridge/claude-opus-5-5`, `claude-bridge/claude-fable-5-1`, or `claude-bridge/claude-haiku-4-5`.
 
 Behind the scenes, pi's tools are bridged to Claude Code but it should all work like normal in pi. Bash commands get a 120-second default timeout (matching Claude Code's default) since pi's bash has no timeout by default. Skills in pi are copied over to Claude Code's system prompt so should work as they would with any other pi provider. Steering works mid-turn: a message sent while Claude is running a tool reaches it at that tool boundary, not after the whole turn finishes.
 
-The model list comes from pi-ai's Anthropic catalog automatically — when pi-ai adds a new Claude model, it appears in `/model` after updating the package, no bridge update needed. Dated snapshot ids (e.g. `claude-opus-4-5-20251101`) are not shown. Selection by shortcut or partial id always prefers an exact match first, then the newest version of the matching family.
+The model list normally comes from pi-ai's Anthropic catalog automatically. Temporary fallbacks cover releases that Claude Code supports before pi-ai catalogs them; pi-ai's metadata wins when it catches up. Dated snapshot ids (e.g. `claude-opus-4-5-20251101`) are not shown. Selection by shortcut or partial id always prefers an exact match first, then the newest version of the matching family.
 
-**1M Context:** 1M is enabled per a *measured* list — models verified to serve 1M through the SDK on every plan (Fable 5/5.1, Opus 5/4.8/4.7, Sonnet 5). A new model appearing from pi-ai starts at 200K context until it's measured and added to that list, so no model can 400/429 its way through every turn. Opus 4.6 only gets 1M if you're on a Max plan or pay for Extra Usage. Sonnet 4.6 only gets 1M if you pay for Extra Usage. You will need to set `provider.plan` and/or `provider.longContextExtraUsage` for 1M context in Opus 4.6/Sonnet 4.6 as described in [Configuration](#configuration).
+**1M Context:** 1M is enabled per a *measured* list — models verified to serve 1M through the SDK on every plan (Fable 5/5.1, Opus 5.5/5/4.8/4.7, Sonnet 5). A new model appearing from pi-ai starts at 200K context until it's measured and added to that list, so no model can 400/429 its way through every turn. Opus 4.6 only gets 1M if you're on a Max plan or pay for Extra Usage. Sonnet 4.6 only gets 1M if you pay for Extra Usage. You will need to set `provider.plan` and/or `provider.longContextExtraUsage` for 1M context in Opus 4.6/Sonnet 4.6 as described in [Configuration](#configuration).
 
 ## AskClaude Tool
 

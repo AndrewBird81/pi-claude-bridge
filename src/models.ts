@@ -19,6 +19,20 @@ function isDatedAlias(id: string): boolean {
 // sink below all known ones.
 const FAMILY_ORDER = ["fable", "opus", "sonnet", "haiku"];
 
+// Claude Code can ship before pi-ai's catalog. Keep temporary entries here and
+// let the catalog win automatically once it catches up.
+export const CLAUDE_CODE_MODEL_FALLBACKS = [
+	{
+		id: "claude-opus-5-5",
+		name: "Claude Opus 5.5",
+		reasoning: true,
+		input: ["text", "image"],
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+	},
+];
+
 // Project pi-ai's model entries down to the fields pi's registerProvider expects,
 // newest generation first. Context-dependent display labels are applied after
 // plan/long-context config is known.
@@ -32,6 +46,7 @@ function versionRank(id: string): { family: string; tuple: [number, number] } {
 export function buildModels<T extends { id: string; [key: string]: any }>(piAiModels: T[]) {
 	return piAiModels
 		.filter((m) => typeof m.id === "string" && !isDatedAlias(m.id))
+		.filter((m, i, models) => models.findIndex((candidate) => candidate.id === m.id) === i)
 		.sort((a, b) => {
 			const fa = FAMILY_ORDER.indexOf(versionRank(a.id).family);
 			const fb = FAMILY_ORDER.indexOf(versionRank(b.id).family);
@@ -79,6 +94,7 @@ export type ClaudeCodeRuntimeModel = {
 // [1m] ids verified to serve 1M on every plan. A new model serves 200K until
 // someone measures it (diag/context-size.mjs) and adds it here.
 const MEASURED_ONE_M = new Set([
+	"claude-opus-5-5",
 	"claude-fable-5",
 	"claude-fable-5-1",
 	"claude-opus-5",
