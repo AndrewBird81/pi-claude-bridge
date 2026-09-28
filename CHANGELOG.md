@@ -2,6 +2,7 @@
 
 ## UNRELEASED
 
+- **Add: Claude Sonnet 5.5** — expose `claude-sonnet-5-5` while Claude Code is ahead of pi-ai's catalog; the fallback disappears automatically once pi-ai supplies the same id. Live probes verified `claude-sonnet-5-5[1m]` serves 1M context (bare id: 200K). The `sonnet` shortcut now resolves to it.
 - **Add: Claude Opus 5.5** — expose `claude-opus-5-5` while Claude Code is ahead of pi-ai's catalog; the fallback disappears automatically once pi-ai supplies the same id. Bump the Claude Agent SDK to 0.3.280, whose bundled Claude Code 2.1.280 supports the model. Live probes verified `claude-opus-5-5[1m]` serves 1M context and 128K output on both configured subscriptions.
 
 ## 0.8.0 — 2026-09-20

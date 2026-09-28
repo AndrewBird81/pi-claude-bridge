@@ -31,6 +31,15 @@ export const CLAUDE_CODE_MODEL_FALLBACKS = [
 		maxTokens: 128_000,
 		thinkingLevelMap: { xhigh: "xhigh", max: "max" },
 	},
+	{
+		id: "claude-sonnet-5-5",
+		name: "Claude Sonnet 5.5",
+		reasoning: true,
+		input: ["text", "image"],
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+	},
 ];
 
 // Project pi-ai's model entries down to the fields pi's registerProvider expects,
@@ -100,6 +109,7 @@ const MEASURED_ONE_M = new Set([
 	"claude-opus-5",
 	"claude-opus-4-8",
 	"claude-opus-4-7",
+	"claude-sonnet-5-5",
 	"claude-sonnet-5",
 ]);
 

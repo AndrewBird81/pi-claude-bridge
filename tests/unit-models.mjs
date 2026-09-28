@@ -43,6 +43,7 @@ describe("MODELS projection", () => {
 		}
 		// Spot-check coverage of every current family and the ahead-of-pi-ai fallback.
 		assert.ok(find(models, "claude-opus-5-5"), "opus-5-5 present");
+		assert.ok(find(models, "claude-sonnet-5-5"), "sonnet-5-5 present");
 		assert.ok(find(models, "claude-opus-5"), "opus-5 present");
 		assert.ok(find(models, "claude-fable-5-1"), "fable-5-1 present");
 		assert.ok(find(models, "claude-haiku-4-5"), "haiku present");
@@ -95,6 +96,10 @@ describe("resolveModel", () => {
 		assert.equal(resolveModel(models, "opus")?.id, "claude-opus-5-5");
 	});
 
+	it("sonnet shortcut resolves to claude-sonnet-5-5 (newest sonnet)", () => {
+		assert.equal(resolveModel(models, "sonnet")?.id, "claude-sonnet-5-5");
+	});
+
 	it("exact id beats newer partial match (claude-fable-5 → fable-5, not 5-1)", () => {
 		assert.equal(resolveModel(models, "claude-fable-5")?.id, "claude-fable-5");
 	});
@@ -102,7 +107,7 @@ describe("resolveModel", () => {
 
 describe("Claude Code runtime policy", () => {
 	it("measured-1M ids send [1m] on every plan", () => {
-		for (const id of ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-fable-5", "claude-fable-5-1", "claude-sonnet-5"]) {
+		for (const id of ["claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-fable-5", "claude-fable-5-1", "claude-sonnet-5-5", "claude-sonnet-5"]) {
 			assert.deepEqual(resolveClaudeCodeRuntimeModel(oneM(id), PRO), { cliModelId: `${id}[1m]`, contextWindow: 1000000 });
 		}
 	});
@@ -153,6 +158,7 @@ describe("applyLongContext", () => {
 	it("registers 1M for measured-1M models", () => {
 		const registered = applyLongContext(models, PRO);
 		assert.equal(find(registered, "claude-opus-5-5").contextWindow, 1000000);
+		assert.equal(find(registered, "claude-sonnet-5-5").contextWindow, 1000000);
 		assert.equal(find(registered, "claude-opus-5").contextWindow, 1000000);
 		assert.equal(find(registered, "claude-opus-4-7").contextWindow, 1000000);
 		assert.equal(find(registered, "claude-fable-5-1").contextWindow, 1000000);
@@ -187,6 +193,7 @@ describe("applyLongContext", () => {
 	it("labels exactly the registered 1M models", () => {
 		const pro = applyLongContext(models, PRO);
 		assert.equal(find(pro, "claude-opus-5-5").name, "Claude Opus 5.5 1M");
+		assert.equal(find(pro, "claude-sonnet-5-5").name, "Claude Sonnet 5.5 1M");
 		assert.equal(find(pro, "claude-opus-5").name, "Claude Opus 5 1M");
 		assert.equal(find(pro, "claude-opus-4-6").name, "Claude Opus 4.6");
 		assert.equal(find(pro, "claude-haiku-4-5").name, "Claude Haiku 4.5 (latest)");
