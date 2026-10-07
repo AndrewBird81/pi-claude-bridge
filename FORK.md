@@ -14,10 +14,13 @@ in `.upstream-release`; do not use unreleased `upstream/main` as the baseline.
   the shared session rather than resuming a session from another account.
 - A redirected Pi agent directory falls back to the default global bridge config
   when it has no local config.
+- `CLAUDE_CODE_MODEL_FALLBACKS` lists models Claude Code serves before pi-ai
+  catalogs them (currently `claude-haiku-5-5`). pi-ai's entry wins once it
+  lists the id; drop the fallback at the next sync after that.
 
-Upstream owns the Pi 0.86 transcript compatibility, model catalog, and Fable
-5.1 support. Fork commits must not duplicate those fixes or add fork release
-notes to `CHANGELOG.md`.
+Upstream owns the Pi 0.86 transcript compatibility, the pi-ai-driven model
+catalog, and Fable 5.1 support. Fork commits must not duplicate those fixes
+or add fork release notes to `CHANGELOG.md`.
 
 ## Source ledger
 
@@ -37,7 +40,13 @@ the fork's copy of surrounding upstream lines.
 - `convertPiMessages(..., providerId)` replays thinking signatures minted by
   the account whose session is being rebuilt, not only bare `claude-bridge`.
 
+`src/models.ts`
+- `CLAUDE_CODE_MODEL_FALLBACKS`, and `buildModels` dropping duplicate ids so
+  pi-ai's entry wins over a fallback.
+- `claude-haiku-5-5` in `MEASURED_ONE_M`.
+
 `src/index.ts`
+- `MODELS` appends `CLAUDE_CODE_MODEL_FALLBACKS` to pi-ai's catalog.
 - `Account`, `defaultAccount`, `accountsById`, `accountFor`, `claudeDirFor`,
   `childEnvFor`, `configureAccounts`. `configureAccounts` absorbs upstream's
   activation-time `longContextSettings` block; the activation body calls it.

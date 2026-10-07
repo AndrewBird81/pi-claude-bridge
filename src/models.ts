@@ -19,6 +19,20 @@ function isDatedAlias(id: string): boolean {
 // sink below all known ones.
 const FAMILY_ORDER = ["fable", "opus", "sonnet", "haiku"];
 
+// Claude Code can ship a model before pi-ai catalogs it. Temporary entries live
+// here; pi-ai's entry wins automatically once it lists the same id.
+export const CLAUDE_CODE_MODEL_FALLBACKS = [
+	{
+		id: "claude-haiku-5-5",
+		name: "Claude Haiku 5.5",
+		reasoning: true,
+		input: ["text", "image"],
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+	},
+];
+
 // Project pi-ai's model entries down to the fields pi's registerProvider expects,
 // newest generation first. Context-dependent display labels are applied after
 // plan/long-context config is known.
@@ -32,6 +46,7 @@ function versionRank(id: string): { family: string; tuple: [number, number] } {
 export function buildModels<T extends { id: string; [key: string]: any }>(piAiModels: T[]) {
 	return piAiModels
 		.filter((m) => typeof m.id === "string" && !isDatedAlias(m.id))
+		.filter((m, i, models) => models.findIndex((candidate) => candidate.id === m.id) === i)
 		.sort((a, b) => {
 			const fa = FAMILY_ORDER.indexOf(versionRank(a.id).family);
 			const fb = FAMILY_ORDER.indexOf(versionRank(b.id).family);
@@ -90,6 +105,7 @@ const MEASURED_ONE_M = new Set([
 	"claude-opus-4-7",
   "claude-sonnet-5",
 	"claude-sonnet-5-5",
+	"claude-haiku-5-5", // Max without Extra Usage, SDK 0.3.293; the bare id also served 1M
 ]);
 
 // Measured exceptions: pi-ai declares 1M and the [1m] id works, but only when

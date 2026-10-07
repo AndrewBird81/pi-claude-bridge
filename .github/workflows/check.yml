@@ -39,7 +39,7 @@ jobs:
           # and keep upstream's changelog untouched.
           unexplained=$(comm -23 \
             <(git diff --name-only "$baseline" HEAD -- src/ CHANGELOG.md | sort) \
-            <(printf '%s\n' src/config.ts src/convert.ts src/index.ts | sort))
+            <(printf '%s\n' src/config.ts src/convert.ts src/index.ts src/models.ts | sort))
           if [[ -n "$unexplained" ]]; then
             echo "diff against $baseline touches files outside the FORK.md ledger:" >&2
             echo "$unexplained" >&2
