@@ -15,7 +15,7 @@ in `.upstream-release`; do not use unreleased `upstream/main` as the baseline.
 - A redirected Pi agent directory falls back to the default global bridge config
   when it has no local config.
 - `CLAUDE_CODE_MODEL_FALLBACKS` lists models Claude Code serves before pi-ai
-  catalogs them (currently `claude-haiku-5-5`). pi-ai's entry wins once it
+  catalogs them (currently `claude-fable-5-2` and `claude-haiku-5-5`). pi-ai's entry wins once it
   lists the id; drop the fallback at the next sync after that.
 
 Upstream owns the Pi 0.86 transcript compatibility, the pi-ai-driven model
@@ -43,7 +43,7 @@ the fork's copy of surrounding upstream lines.
 `src/models.ts`
 - `CLAUDE_CODE_MODEL_FALLBACKS`, and `buildModels` dropping duplicate ids so
   pi-ai's entry wins over a fallback.
-- `claude-haiku-5-5` in `MEASURED_ONE_M`.
+- `claude-fable-5-2` and `claude-haiku-5-5` in `MEASURED_ONE_M`.
 
 `src/index.ts`
 - `MODELS` appends `CLAUDE_CODE_MODEL_FALLBACKS` to pi-ai's catalog.

@@ -21,6 +21,15 @@ describe("Claude Code-ahead fallbacks", () => {
 		assert.ok(find(models, "claude-haiku-4-5"), "haiku-4-5 stays selectable");
 	});
 
+	it("lists claude-fable-5-2 without thinking off, and fable resolves to it at 1M", () => {
+		assert.deepEqual(find(models, "claude-fable-5-2")?.thinkingLevelMap, { off: null, xhigh: "xhigh", max: "max" });
+		assert.equal(resolveModel(models, "fable")?.id, "claude-fable-5-2");
+		assert.equal(resolveModel(models, "claude-fable-5-1")?.id, "claude-fable-5-1");
+		const registered = find(applyLongContext(models, MAX), "claude-fable-5-2");
+		assert.equal(registered.contextWindow, 1000000);
+		assert.equal(claudeCodeModelId(registered, MAX), "claude-fable-5-2[1m]");
+	});
+
 	it("prefers pi-ai's entry once the catalog lists a fallback id", () => {
 		const merged = buildModels([{ id: "claude-haiku-5-5", name: "Catalog name" }, ...CLAUDE_CODE_MODEL_FALLBACKS]);
 		assert.equal(merged.filter((m) => m.id === "claude-haiku-5-5").length, 1);

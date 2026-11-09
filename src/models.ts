@@ -23,6 +23,15 @@ const FAMILY_ORDER = ["fable", "opus", "sonnet", "haiku"];
 // here; pi-ai's entry wins automatically once it lists the same id.
 export const CLAUDE_CODE_MODEL_FALLBACKS = [
 	{
+		id: "claude-fable-5-2",
+		name: "Claude Fable 5.2",
+		reasoning: true,
+		input: ["text", "image"],
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+		thinkingLevelMap: { off: null, xhigh: "xhigh", max: "max" },
+	},
+	{
 		id: "claude-haiku-5-5",
 		name: "Claude Haiku 5.5",
 		reasoning: true,
@@ -99,6 +108,7 @@ export type ClaudeCodeRuntimeModel = {
 const MEASURED_ONE_M = new Set([
 	"claude-fable-5",
 	"claude-fable-5-1",
+	"claude-fable-5-2", // Max, SDK 0.3.321
 	"claude-opus-5-5",
 	"claude-opus-5",
 	"claude-opus-4-8",
