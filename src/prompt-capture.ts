@@ -1,7 +1,7 @@
 import type { Skill } from "@earendil-works/pi-coding-agent";
 import { formatProjectContext } from "./agents-md.js";
 import { DEBUG_LOG_PATH } from "./log-paths.js";
-import { renderSkillsBlock, type SkillReadTool } from "./skills.js";
+import { renderSkillsBlock, rewriteSkillsBlock, type SkillReadTool } from "./skills.js";
 
 // What pi assembled for one agent, kept so the bridge can append only the
 // portable parts after Claude Code's own preset.
@@ -72,7 +72,19 @@ export class PromptCaptures {
 		this.onDiagnose = onDiagnose ?? (() => {});
 	}
 
+	private live = false;
+
+	/** Whether the host reports the prompt each turn is actually sent with. pi's agent
+	 *  loop does, at agent_start and turn_start. A host that runs its own loop (one built
+	 *  on pi-durable) never fires those, so no key can match what it sends and the
+	 *  prompt's named sections are the only account of it: see `captureFromSections`.
+	 *  Sticky and process-wide like the captures themselves. */
+	get reportsLivePrompts(): boolean {
+		return this.live;
+	}
+
 	record(systemPrompt: string, input: PromptCaptureInput, source?: string): void {
+		if (source === "agent_start" || source === "turn_start") this.live = true;
 		const existing = this.captures.get(systemPrompt);
 		const customChanged = existing?.custom !== input.custom;
 		const capture = existing ?? {
@@ -290,6 +302,50 @@ export function projectPromptCapture(
 	options: { skillReadTool: SkillReadTool },
 ): string | undefined {
 	return projectCapture(capture, options, new Set());
+}
+
+/** Section keys pi's prompt builders fill with harness text: the tool list, the tool
+ *  guidelines and pi's documentation routing. Claude Code's preset carries its own. */
+const HARNESS_SECTIONS = new Set(["tools", "rules", "docs"]);
+
+/**
+ * The capture for a prompt whose host never reported it (`reportsLivePrompts` false).
+ *
+ * Such a host hands the provider only the transcript, where the prompt arrives as named
+ * sections. Everything is forwarded except what is known to be pi's harness: the
+ * `tools`, `rules` and `docs` sections, and a `preamble` that is pi's stock one. A
+ * `preamble` holding anything else is the host's or the user's own prompt and is kept.
+ * The result is still subject to `projectPromptCapture`'s sendability guard, so harness
+ * text under an unexpected key fails the turn instead of leaking.
+ *
+ * `skills` follows the capture path: dropped when the model has no read tool to load a
+ * skill with, and pointed at the MCP read tool otherwise.
+ */
+export function captureFromSections(
+	assembledPrompt: string,
+	parts: { content: string; sections: ReadonlyMap<string, string> },
+	options: { skillReadTool: SkillReadTool },
+): PromptCapture {
+	const kept = parts.content ? [parts.content] : [];
+	for (const [key, text] of parts.sections) {
+		if (HARNESS_SECTIONS.has(key)) continue;
+		// A host may wrap each section in a tag named after its key.
+		if (key === "preamble" && text.trimStart().replace(/^<preamble>\s*/, "").startsWith(PI_PREAMBLE)) continue;
+		if (key === "skills") {
+			if (options.skillReadTool === "none") continue;
+			kept.push(options.skillReadTool === "mcp" ? rewriteSkillsBlock(text) : text);
+			continue;
+		}
+		kept.push(text);
+	}
+	return {
+		assembledPrompt,
+		custom: kept.length > 0 ? kept.join("\n\n") : undefined,
+		contextFiles: [],
+		skills: [],
+		inherited: [],
+		source: "sections",
+	};
 }
 
 /** Skills visible through inherited prompts, ancestor first and once per file. */

@@ -18,6 +18,14 @@ in `.upstream-release`; do not use unreleased `upstream/main` as the baseline.
   catalogs them (currently `claude-fable-5-2` and `claude-haiku-5-5`). pi-ai's entry wins once it
   lists the id; drop the fallback at the next sync after that.
 
+- Hosts that run their own agent loop over the provider (built on pi-durable)
+  work without pi's lifecycle events. Until pi's loop reports a live prompt
+  (`agent_start`/`turn_start`), the bridge projects the prompt from the
+  transcript's named sections and reads a mid-turn compaction off the
+  transcript's head. It also tolerates a signal scoped to one `streamSimple`
+  call and continues a turn resumed by a process that never started it. Under
+  pi none of these paths run. Covered by `tests/unit-durable-host.mjs`.
+
 Upstream owns the Pi 0.86 transcript compatibility, the pi-ai-driven model
 catalog, and Fable 5.1 support. Fork commits must not duplicate those fixes
 or add fork release notes to `CHANGELOG.md`.
@@ -39,6 +47,15 @@ the fork's copy of surrounding upstream lines.
 `src/convert.ts`
 - `convertPiMessages(..., providerId)` replays thinking signatures minted by
   the account whose session is being rebuilt, not only bare `claude-bridge`.
+
+`src/prompt-capture.ts`
+- `PromptCaptures.reportsLivePrompts`, set by `record()` on an `agent_start`
+  or `turn_start` source.
+- `HARNESS_SECTIONS` and `captureFromSections` (needs the `rewriteSkillsBlock`
+  import).
+
+`src/transcript.ts`
+- `currentSystemParts`.
 
 `src/models.ts`
 - `CLAUDE_CODE_MODEL_FALLBACKS`, and `buildModels` dropping duplicate ids so
@@ -65,6 +82,18 @@ the fork's copy of surrounding upstream lines.
 - Activation registers one provider per account through `registerAccount`,
   including the later-instance `session_start` path.
 - `__test` exports `configureAccounts`, `accountFor`, `childEnvFor`.
+- pi-durable hosts: `AbortBinding`, `abortBindings`, `CALL_ENDED_REASON`,
+  `isCallEnd`, `bindAbortSignal`, `hostAborted`, replacing the fresh query's
+  direct `options.signal` listener and its three `options?.signal?.aborted`
+  checks; the tool-result path rebinds to its own call's signal.
+- pi-durable hosts: `hostRunsPiLoop`, `transcriptHeads`, `transcriptHead`,
+  `servedSessions`, `CONTINUE_AFTER_RESTART_PROMPT`. In `streamClaudeAgentSdk`:
+  `systemParts`, the changed-head check before `rewrittenUnderQuery`,
+  `coldResume` on the orphaned-result branch and its continue prompt, the
+  superseded-query scan before the fresh query, and `captureFromSections` in
+  place of `resolveOrDerive` when `hostRunsPiLoop()` is false.
+- `discardRewrittenQuery` takes `why` (`"rewritten"` by default) for the
+  superseded case's messages.
 
 Anything else under `src/` is upstream and must be byte-identical to the
 tracked release.

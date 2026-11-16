@@ -18,6 +18,7 @@ import { QueryContext, ctx } from "./query-state.js";
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { claudeCodeSettings, loadConfig, markStartupNoticeShown, type Config } from "./config.js";
 import {
+	captureFromSections,
 	collectPromptSkills,
 	projectPromptCapture,
 	sharedPromptCaptures,
@@ -27,7 +28,7 @@ import { collectCarriedAttachments, placeCarriedAttachments, type CarriedAttachm
 import { createToolServer } from "./mcp-server.js";
 import { buildActionSummary, type ToolCallState } from "./askclaude-ui.js";
 import { askClaudeCallTags, askClaudeToolDescription, buildAskClaudeParams, resolveAskClaudeDefaults, resolveAskClaudeMode, type AskClaudeMode } from "./askclaude-schema.js";
-import { nonSystemMessages, toBridgeContext } from "./transcript.js";
+import { currentSystemParts, nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 
 // --- Debug logging ---
@@ -1258,6 +1259,58 @@ function markStreamComplete(stream: AssistantMessageEventStream | null): void {
 	if (stream) completedStreams.add(stream as object);
 }
 
+/** How a query hears its host's abort. One Claude Code query spans several streamSimple
+ *  calls (the first prompt, then each tool-result delivery), so it follows the signal of
+ *  whichever call is current. pi passes one run-scoped signal to all of them and nothing
+ *  is ever rebound; a host that scopes the signal to a single call needs the rest. */
+type AbortBinding = {
+	/** Stop the query: what a real abort does. */
+	abort: () => void;
+	signal?: AbortSignal;
+	unbind?: () => void;
+	/** The current signal ended with its call, not with a user abort: the host has no
+	 *  way left to stop this query, so only the session's next turn can retire it. */
+	callEnded: boolean;
+};
+const abortBindings = new WeakMap<QueryContext, AbortBinding>();
+
+/** pi-durable gives each generation request its own signal and aborts it with this
+ *  reason once the request returns (scheduler `endedError`), while the query that request
+ *  started sits parked at a tool boundary waiting for the next one. Matched on the message
+ *  because nothing else tells it from a stop: pi, pi-durable's user abort and its close all
+ *  call abort() bare (AbortError), and pi-subagents stops children with plain Errors. If
+ *  pi-durable rewords it, tool results fail with "Operation aborted" until this follows. */
+const CALL_ENDED_REASON = /^Task \S+ invocation has ended$/;
+
+function isCallEnd(signal: AbortSignal, stream: AssistantMessageEventStream): boolean {
+	const reason: unknown = signal.reason;
+	return completedStreams.has(stream as object) && reason instanceof Error && CALL_ENDED_REASON.test(reason.message);
+}
+
+/** Follow `signal`, the one passed to the call that owns `stream`. */
+function bindAbortSignal(binding: AbortBinding, signal: AbortSignal | undefined, stream: AssistantMessageEventStream): void {
+	if (!signal || binding.signal === signal) return;
+	binding.unbind?.();
+	const onSignal = () => {
+		if (isCallEnd(signal, stream)) {
+			binding.callEnded = true;
+			debug("provider: the call's signal ended with the call — query stays parked for the next one");
+			return;
+		}
+		binding.abort();
+	};
+	binding.signal = signal;
+	binding.callEnded = false;
+	binding.unbind = () => signal.removeEventListener("abort", onSignal);
+	if (signal.aborted) onSignal();
+	else signal.addEventListener("abort", onSignal, { once: true });
+}
+
+/** The host aborted the query, as opposed to its current call merely ending. */
+function hostAborted(binding: AbortBinding): boolean {
+	return Boolean(binding.signal?.aborted) && !binding.callEnded;
+}
+
 function claimCurrentPiStream(stream: AssistantMessageEventStream, label: string, c: QueryContext): void {
 	if (c.currentPiStream && !completedStreams.has(c.currentPiStream as object)) {
 		debug(`WARNING: currentPiStream overwritten before terminal event (${label}); activeQuery=${Boolean(c.activeQuery)} pendingHandlers=${c.pendingToolCalls.size}`);
@@ -1754,7 +1807,7 @@ const CONTINUE_AFTER_REWRITE_PROMPT =
  *  rewritten history — this tool result included, since it is already in that
  *  history — so the turn continues instead of ending here. Nothing is lost by
  *  killing the subprocess: pi owns the only copy of the conversation that counts. */
-function discardRewrittenQuery(c: QueryContext): void {
+function discardRewrittenQuery(c: QueryContext, why: "rewritten" | "superseded" = "rewritten"): void {
 	const discarded = c.activeQuery as { interrupt?: () => Promise<unknown>; close?: () => void } | null;
 	if (discarded) abandonedQueries.add(discarded);
 	c.activeQuery = null;
@@ -1762,11 +1815,11 @@ function discardRewrittenQuery(c: QueryContext): void {
 	// contextForToolResults only matches ids against contexts still in it.
 	activeQueryContexts.delete(c);
 	c.turnToolCallIds = [];
-	c.promptStream?.fail(new Error("conversation rewritten"));
+	c.promptStream?.fail(new Error(why === "rewritten" ? "conversation rewritten" : "turn superseded"));
 	c.promptStream = null;
 	// Settle the parked handlers before killing the CLI, for drainForAbort's
 	// reason: one left awaiting a dead subprocess never settles.
-	c.releasePendingToolCalls("Context was compacted; this query was discarded.");
+	c.releasePendingToolCalls(why === "rewritten" ? "Context was compacted; this query was discarded." : "The turn ended; this query was discarded.");
 	void discarded?.interrupt?.().catch(() => {});
 	try { discarded?.close?.(); } catch {}
 	// The CLI we just killed may still flush a record into the session JSONL, and
@@ -1776,8 +1829,36 @@ function discardRewrittenQuery(c: QueryContext): void {
 	const state = sessionStateFor(c.piSessionId);
 	if (state) setSessionStateFor(c.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
 	if (c.piSessionId) historyRewrittenBySession.delete(c.piSessionId);
-	debug("provider: history rewritten under a parked query — discarded it, rebuilding from current history");
+	debug(why === "rewritten"
+		? "provider: history rewritten under a parked query — discarded it, rebuilding from current history"
+		: "provider: the session started a new turn over a parked query its host could no longer stop — discarded it");
 }
+
+/** pi's agent loop reports each prompt it sends (agent_start, turn_start) and each
+ *  history rewrite (session_compact, session_tree). A host that runs its own loop over
+ *  the provider — one built on pi-durable — reports neither, so both are read off the
+ *  transcript instead. Seeing a live prompt report is what tells the two apart. */
+function hostRunsPiLoop(): boolean {
+	return promptCaptures.reportsLivePrompts;
+}
+
+/** The first message of the history each query was built from. Compaction replaces it
+ *  with a summary, which is the only sign of a rewrite a host outside pi's loop gives. */
+const transcriptHeads = new WeakMap<QueryContext, string>();
+
+function transcriptHead(messages: Context["messages"]): string {
+	const first = messages[0];
+	return first ? `${first.role}:${first.timestamp}` : "";
+}
+
+/** Sessions this module has started a query for. A tool result arriving for any other
+ *  session means the process that asked for it is gone: see the cold-resume branch. */
+const servedSessions = new Set<string>();
+
+/** Sent when a turn resumes in a process that never saw it start. */
+const CONTINUE_AFTER_RESTART_PROMPT =
+	"[The host process restarted while you were waiting for a tool result. "
+	+ "The conversation above ends with that result. Continue the task from there.]";
 
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
@@ -1786,6 +1867,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// pi hands providers a transcript (prompt/tools folded into system messages) — fold it
 	// back out to the prompt/tools fields every cursor write, syncSharedSession call and
 	// prompt-capture lookup below assumes (issue #106).
+	const systemParts = currentSystemParts(context.messages);
 	context = toBridgeContext(context);
 
 	// One-off summarizer calls arrive HERE too, not only via isolatedStreamFn: /bug report
@@ -1815,6 +1897,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// The staleness mark is per pi session: a subagent's compaction (its own
 	// AgentSession, sharing this process) must not discard the parent's parked
 	// query, and vice versa.
+	// Outside pi's loop no session_compact arrives to arm the mark: a changed head does.
+	if (resultCtx && !hostRunsPiLoop() && transcriptHeads.get(resultCtx) !== transcriptHead(context.messages)) {
+		debug("provider: the transcript's head changed under a parked query — its host compacted");
+		resultCtx.historyStale = true;
+	}
 	const rewrittenUnderQuery = Boolean(resultCtx?.historyStale);
 	if (resultCtx && rewrittenUnderQuery) {
 		discardRewrittenQuery(resultCtx);
@@ -1835,6 +1922,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	if (resultCtx) {
 		claimCurrentPiStream(stream, "tool-result", resultCtx);
 		resultCtx.resetTurnState(model);
+		const binding = abortBindings.get(resultCtx);
+		if (binding) bindAbortSignal(binding, options?.signal, stream);
 		// A rewrite that armed the mark after this query parked gets copied here,
 		// though markRebuildForSession usually reaches it directly.
 		if (!resultCtx.historyStale && resultCtx.piSessionId && historyRewrittenBySession.has(resultCtx.piSessionId)) {
@@ -1864,7 +1953,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// branch above already siphoned off the stale-query case, which goes on to a
 	// rebuild instead — that one has somewhere to deliver the result to.
 	const lastMsg = context.messages[context.messages.length - 1];
-	if (lastMsg?.role === "toolResult" && !rewrittenUnderQuery) {
+	// A durable host resumes a turn after its process died: the transcript ends with a
+	// tool result this process never asked for. That is not an abort's leftover — the
+	// turn is still owed an answer, so continue it over the rebuilt history. pi never
+	// gets here: its orphaned result always follows a query this module started.
+	const coldResume = lastMsg?.role === "toolResult" && !rewrittenUnderQuery
+		&& options?.sessionId !== undefined && !servedSessions.has(options.sessionId);
+	if (lastMsg?.role === "toolResult" && !rewrittenUnderQuery && !coldResume) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
 		// With no query in flight anywhere, the top-level session this result
 		// belongs to is the one whose turn just ended: its cursor advances to
@@ -1888,6 +1983,18 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// --- Fresh query ---
 
+	// A query whose host could no longer stop it (its call's signal ended while it sat
+	// parked) is still here only if the turn died without another call: an abort during
+	// the tool, which such a host settles on its own side. A session runs one turn at a
+	// time, so its next fresh query retires the leftover instead of running beside it.
+	if (options?.sessionId) {
+		for (const c of [...activeQueryContexts]) {
+			if (c.piSessionId !== options.sessionId || !abortBindings.get(c)?.callEnded) continue;
+			discardRewrittenQuery(c, "superseded");
+			activeQuery = ctx().activeQuery !== null;
+		}
+	}
+
 	// 1. Determine reentrancy. Reentrant queries get their own QueryContext so
 	//    background subagents can run concurrently with the parent query.
 	const isReentrant = activeQuery;
@@ -1908,12 +2015,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	let promptCapture: PromptCapture | undefined;
 	let systemPromptAppend: string | undefined;
 	try {
-		promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
-		systemPromptAppend = promptCapture
-			? projectPromptCapture(promptCapture, {
-				skillReadTool: mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none",
-			})
-			: undefined;
+		const skillReadTool = mcpTools.some((tool) => tool.name === "read") ? "mcp" : "none";
+		// A host outside pi's loop never reports its prompts, so no key can match; the
+		// prompt's named sections say what is portable instead.
+		promptCapture = !hostRunsPiLoop() && context.systemPrompt && systemParts?.sections.size
+			? captureFromSections(context.systemPrompt, systemParts, { skillReadTool })
+			: promptCaptures.resolveOrDerive(context.systemPrompt);
+		systemPromptAppend = promptCapture ? projectPromptCapture(promptCapture, { skillReadTool }) : undefined;
 	} catch (err) {
 		// resolveOrDerive and projectPromptCapture throw to stop a turn that would lose
 		// its instructions or leak pi's harness text. Report it on the stream, as pi-ai's
@@ -1949,6 +2057,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// follow-up) and on SessionState. A fresh instance of this module inside a
 	// worktree-spawned subagent has its own contexts; each records its own.
 	queryCtx.piSessionId = options?.sessionId ?? null;
+	if (options?.sessionId) servedSessions.add(options.sessionId);
+	transcriptHeads.set(queryCtx, transcriptHead(context.messages));
 	// A discarded query's replacement reuses this context; without the reset its
 	// first tool result would sit on armed staleness again (the mark is consumed
 	// from the set, not from here) and re-discard a healthy query.
@@ -1979,6 +2089,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	if (rewrittenUnderQuery && !promptText && !promptBlocks) {
 		promptText = CONTINUE_AFTER_REWRITE_PROMPT;
 		debug(`provider: continuing the turn after a rewritten history, ${context.messages.length} msgs rebuilt`);
+	} else if (coldResume && !promptText && !promptBlocks) {
+		promptText = CONTINUE_AFTER_RESTART_PROMPT;
+		debug(`provider: continuing a turn this process never started, ${context.messages.length} msgs rebuilt`);
 	}
 
 	// Guard: empty prompt means the last context message isn't a user message.
@@ -2106,10 +2219,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		drainForAbort(abortCtx, promptStream);
 		requestAbort();
 	};
-	if (options?.signal) {
-		if (options.signal.aborted) onAbort();
-		else options.signal.addEventListener("abort", onAbort, { once: true });
-	}
+	const abortBinding: AbortBinding = { abort: onAbort, callEnded: false };
+	abortBindings.set(queryCtx, abortBinding);
+	bindAbortSignal(abortBinding, options?.signal, stream);
 
 	// Background consumer — runs until query ends
 	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
@@ -2125,7 +2237,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 
 			// --- Abort detection in normal completion path ---
-			if (wasAborted || options?.signal?.aborted) {
+			if (wasAborted || hostAborted(abortBinding)) {
 				// The killed subprocess may flush a late record into this session's
 				// JSONL — its own mirror's next sync must rebuild and rotate.
 				const state = sessionStateFor(queryCtx.piSessionId);
@@ -2172,12 +2284,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			finalizeCurrentStream(queryCtx, queryCtx.turnOutput?.stopReason);
 		})
 		.catch((error) => {
-			debug(`provider: query error, model=${cliModel}, aborted=${Boolean(options?.signal?.aborted)}, error=`, error);
+			debug(`provider: query error, model=${cliModel}, aborted=${hostAborted(abortBinding)}, error=`, error);
 			if (abandonedQueries.has(sdkQuery)) {
 				debug("provider: discarded query ended in error, leaving session and stream to its replacement");
 				return;
 			}
-			if ((wasAborted || options?.signal?.aborted)) {
+			if ((wasAborted || hostAborted(abortBinding))) {
 				const state = sessionStateFor(queryCtx.piSessionId);
 				if (state) setSessionStateFor(queryCtx.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
 			} else {
@@ -2188,7 +2300,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 			promptStream.fail(error instanceof Error ? error : new Error(String(error)));
 			if (queryCtx.turnOutput) {
-				queryCtx.turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
+				queryCtx.turnOutput.stopReason = hostAborted(abortBinding) ? "aborted" : "error";
 				// The SDK drops its copy of the result text if any message follows the error
 				// result, so prefer the cause consumeQuery recorded off the result itself.
 				queryCtx.turnOutput.errorMessage ??= error instanceof Error ? error.message : String(error);
@@ -2205,7 +2317,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			queryCtx.currentPiStream = null;
 		})
 		.finally(() => {
-			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
+			abortBinding.unbind?.();
 			// Settle any ack still parked in the generator — the CLI is gone, so
 			// nothing will resume it. Clear the handle only if a later query
 			// hasn't already claimed the shared context.

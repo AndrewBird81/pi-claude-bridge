@@ -33,6 +33,17 @@ The model list comes from pi-ai's Anthropic catalog automatically — when pi-ai
 
 **1M Context:** Fable 5/5.1/5.2, Opus 5.5/5/4.8/4.7, Sonnet 5.5/5, and Haiku 5.5 get 1M context. Opus 4.6 gets 1M only on a Max plan or with Extra Usage, and Sonnet 4.6 only with Extra Usage — set `provider.plan` and/or `provider.longContextExtraUsage` as described in [Configuration](#configuration).
 
+### Hosts built on pi-durable
+
+A host that runs its own agent loop over the provider (pi-durable's `Harness`, rather than pi's agent loop) needs no configuration; register the provider and use it. The bridge detects such a host by the absence of pi's `agent_start`/`turn_start` prompt reports and then:
+
+- forwards the prompt's named sections, minus pi's harness (`tools`, `rules`, `docs`, and the stock `preamble`), instead of matching a captured prompt;
+- treats pi-durable's end-of-request abort signal as the request ending, not as a user abort, so a query parked at a tool call survives to the next request;
+- continues a turn that a new process resumes after a crash, from the tool result the transcript ends with;
+- rebuilds the Claude Code session when the host compacts history mid-turn.
+
+A turn aborted while a tool is running leaves its Claude Code subprocess parked until that conversation's next message or the host process exits.
+
 ## AskClaude Tool
 
 Opt-in: set `askClaude.enabled` to `true` (see [Configuration](#configuration)). Available when using any non-claude-bridge provider. Pi's LLM can delegate tasks to Claude Code and wait for it to answer a question or perform a task. Examples of how to use:

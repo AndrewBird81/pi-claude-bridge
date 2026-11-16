@@ -52,6 +52,19 @@ function canonicalSystemPrompt(message: SystemMessage | undefined): string | und
 	return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
+/** The current system message's own text and its named sections, in the same order as
+ *  `canonicalSystemPrompt` renders them. Undefined when the transcript has no system message. */
+export function currentSystemParts(
+	messages: Context["messages"],
+): { content: string; sections: Map<string, string> } | undefined {
+	const message = getCurrentSystemMessage(messages);
+	if (!message) return undefined;
+	const sections = new Map<string, string>(
+		Object.entries(message.sections ?? {}).filter((entry): entry is [string, string] => entry[1] !== null),
+	);
+	return { content: contentText(message.content), sections: stableRanked(sections, SECTION_RANK) };
+}
+
 /**
  * Restore the prompt and tools fields expected by the bridge and remove prompt-state
  * messages from conversation history. Contexts without system messages are returned
