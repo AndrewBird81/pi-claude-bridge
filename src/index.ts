@@ -23,13 +23,14 @@ import { newAssistantOutput, QueryContext, type AssistantStep } from "./query-st
 import { makePromptStream, userMessage, type PromptStream } from "./prompt-stream.js";
 import { claudeCodeSettings, globalConfigPath, loadConfig, type Config } from "./config.js";
 import {
+	captureFromSections,
 	projectPromptCapture,
 	sharedPromptCaptures,
 	type PromptCapture,
 } from "./prompt-capture.js";
 import { collectCarriedAttachments } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
-import { nonSystemMessages, toBridgeContext } from "./transcript.js";
+import { currentSystemParts, nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
 import { updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
@@ -1062,6 +1063,20 @@ function parsePartialJson(input: string, fallback: Record<string, unknown>): Rec
 
 const completedStreams = new WeakSet<object>();
 
+/** pi-durable gives each generation request its own signal and aborts it with this
+ *  reason once the request returns (scheduler `endedError`), while the query that request
+ *  opened sits parked at a tool call waiting for the next one. Matched on the message
+ *  because nothing else tells it from a stop: pi, pi-durable's user abort and its close all
+ *  call abort() bare (AbortError), and pi-subagents stops children with plain Errors. If
+ *  pi-durable rewords it, every tool call restarts Claude Code until this follows. */
+const CALL_ENDED_REASON = /^Task \S+ invocation has ended$/;
+
+/** `signal`, passed to the call that owns `stream`, aborted only because that call is over. */
+function isCallEnd(signal: AbortSignal, stream: AssistantMessageEventStream): boolean {
+	const reason: unknown = signal.reason;
+	return completedStreams.has(stream as object) && reason instanceof Error && CALL_ENDED_REASON.test(reason.message);
+}
+
 /** Push a stream's terminal event and end it. Marked complete before end():
  *  claimCurrentPiStream's stale-stream warning and bindRunSignal read the mark. */
 function endStream(stream: AssistantMessageEventStream, event: AssistantMessageEvent): void {
@@ -1779,6 +1794,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// prompt-capture lookup below assumes (issue #106).
 	const traceCallId = traceId("call");
 	const sourceContext = context;
+	const systemParts = currentSystemParts(context.messages);
 	context = toBridgeContext(context);
 	traceInput(traceCallId, sourceContext, context, model, options);
 
@@ -1921,12 +1937,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	let systemPromptAppend: string | undefined;
 	try {
 		traceAssertReady();
-		promptCapture = promptCaptures.resolveOrDerive(context.systemPrompt);
-		systemPromptAppend = promptCapture
-			? projectPromptCapture(promptCapture, {
-				hasReadTool: mcpTools.some((tool) => tool.name === "read"),
-			})
-			: undefined;
+		const hasReadTool = mcpTools.some((tool) => tool.name === "read");
+		// A host outside pi's loop never reports its prompts, so no key can match; the
+		// prompt's named sections say what is portable instead.
+		promptCapture = !promptCaptures.reportsLivePrompts && context.systemPrompt && systemParts?.sections.size
+			? captureFromSections(context.systemPrompt, systemParts, { hasReadTool })
+			: promptCaptures.resolveOrDerive(context.systemPrompt);
+		systemPromptAppend = promptCapture ? projectPromptCapture(promptCapture, { hasReadTool }) : undefined;
 	} catch (err) {
 		// resolveOrDerive and projectPromptCapture throw to stop a turn that would lose
 		// its instructions. Report it on the stream, as pi-ai's provider contract
@@ -2183,9 +2200,20 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				requestAbort();
 			}
 		};
+		// The opening call's signal stops the query at any time, as pi's run-scoped one
+		// must — except when it only says that call is over (see isCallEnd).
+		let callEnded = false;
+		const onOpeningAbort = () => {
+			if (isCallEnd(options!.signal!, stream)) {
+				callEnded = true;
+				debug("provider: the opening call's signal ended with the call — query stays parked for the next one");
+				return;
+			}
+			onAbort();
+		};
 		if (options?.signal) {
-			if (options.signal.aborted) onAbort();
-			else options.signal.addEventListener("abort", onAbort, { once: true });
+			if (options.signal.aborted) onOpeningAbort();
+			else options.signal.addEventListener("abort", onOpeningAbort, { once: true });
 		}
 		// A later run continuing this query from a tool result brings its own signal;
 		// only the latest one is bound, and it is unbound when the query ends. Its abort
@@ -2237,7 +2265,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					throw error;
 				}
 				if (failure) return failQuery(failure);
-				if (wasAborted || options?.signal?.aborted) return failQuery(new Error("Operation aborted"));
+				if (wasAborted || (options?.signal?.aborted && !callEnded)) return failQuery(new Error("Operation aborted"));
 				if (queryCtx.currentPiStream) recordAssistantEmission(queryCtx);
 				commitRecording(!queryCtx.sawResult);
 				// Completion waits for the save, so a failed one ends the turn with it.
@@ -2253,7 +2281,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				traceEvent("query-end", { queryId: traceQueryId, outcome: "complete", ccSession: syncResult.targetSessionId });
 			}, failQuery)
 			.finally(async () => {
-				options?.signal?.removeEventListener("abort", onAbort);
+				options?.signal?.removeEventListener("abort", onOpeningAbort);
 				unbindRunSignal();
 				queryCtx.bindRunSignal = null;
 				queryCtx.commitRecording = null;

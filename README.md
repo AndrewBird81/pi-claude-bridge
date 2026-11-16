@@ -219,6 +219,15 @@ Requires the following in `~/.pi/agent/subagents.json`:
 {"promptInheritance": {"claude-bridge": "portable"}}
 ```
 
+### Hosts built on pi-durable
+
+A host that runs its own agent loop over the provider (pi-durable's `Harness`, rather than pi's agent loop) needs no configuration; register the provider and use it. Two things differ from pi there, and this fork handles both:
+
+- Such a host never reports the prompt it assembled, so nothing can match a captured prompt. Until pi's loop reports one (`agent_start`/`turn_start`), the bridge forwards the prompt's named sections instead, minus pi's harness: `tools`, `rules`, `docs`, and the stock `preamble`.
+- pi-durable ends each request's abort signal when the request returns. The bridge reads that as the request ending, not as a user abort, so the Claude Code query parked at a tool call serves the whole turn instead of being restarted at every tool call.
+
+Resuming a turn after the host process restarts, and a history the host compacts mid-turn, are handled by the bridge's own session sync. A turn aborted while a tool is running leaves its Claude Code subprocess parked until that conversation's next message or the host process exits.
+
 ## Known issues
 
 ### Edits far back in history can still cost cache

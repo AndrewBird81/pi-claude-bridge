@@ -16,6 +16,13 @@ in `.upstream-release`; do not use unreleased `upstream/main` as the baseline.
 - A redirected Pi agent directory falls back to the default global bridge config
   when it has no local config.
 
+- Hosts that run their own agent loop over the provider (built on pi-durable)
+  work without pi's lifecycle events. Until pi's loop reports a live prompt
+  (`agent_start`/`turn_start`), the bridge projects the prompt from the
+  transcript's named sections; and it reads pi-durable's end-of-request abort
+  reason as the request ending, not as an abort. Under pi neither path runs.
+  Covered by `tests/unit-durable-host.mjs`.
+
 Upstream owns session sync, the model catalog and every model the fork once
 listed ahead of it (Fable 5.2, Haiku 5.5). Fork commits must not duplicate
 those or add fork release notes to `CHANGELOG.md`.
@@ -38,6 +45,15 @@ the fork's copy of surrounding upstream lines.
 - `isBridgeProvider`: the default account's provider id or a named account's.
 - `convertPiMessages(..., providerId)` replays thinking signatures minted by
   the account whose session is being imported, not only bare `claude-bridge`.
+
+`src/prompt-capture.ts`
+- `PromptCaptures.reportsLivePrompts`, set by `record()` on an `agent_start`
+  or `turn_start` source.
+- `HARNESS_SECTIONS`, `PI_PREAMBLE` and `captureFromSections` (needs the
+  `MCP_TOOL_PREFIX` import).
+
+`src/transcript.ts`
+- `currentSystemParts`.
 
 `src/message-digests.ts`
 - `isReplayableThinking` uses `isBridgeProvider`, so a named account's signed
@@ -72,6 +88,12 @@ the fork's copy of surrounding upstream lines.
 - Activation registers one provider per account through `registerAccount`,
   including the later-instance `session_start` path.
 - `__test` exports `configureAccounts`, `accountFor`, `childEnvFor`.
+- pi-durable hosts: `streamClaudeAgentSdk` takes `systemParts` before
+  `toBridgeContext` and uses `captureFromSections` in place of
+  `resolveOrDerive` while `reportsLivePrompts` is false.
+- pi-durable hosts: `CALL_ENDED_REASON` and `isCallEnd`; the opening call's
+  signal goes through `onOpeningAbort`, which ignores a call end and records
+  it in `callEnded` for the completion path's `options.signal.aborted` check.
 
 `src/cache-trace.ts` is untouched: its opt-in snapshots read session files from
 the process `CLAUDE_CONFIG_DIR` only.
