@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { Message as PiMessage } from "@earendil-works/pi-ai";
 import { isBridgeProvider, messageContentToText } from "./convert.js";
+import { decodeNarrationTextSignature } from "./narration.js";
 
 function writeString(hash: ReturnType<typeof createHash>, value: string): void {
 	hash.update(`s${value.length}:`);
@@ -130,8 +131,11 @@ function writeAssistant(hash: ReturnType<typeof createHash>, message: Extract<Pi
 	hash.update("assistant:blocks[");
 	for (const block of content) {
 		if (block.type === "text" && block.text) {
-			hash.update("text:");
+			// Narration replays as signed thinking (convert.ts), so its signature counts.
+			const narrationSig = isBridgeProvider(message.provider) ? decodeNarrationTextSignature(block.textSignature) : undefined;
+			hash.update(narrationSig ? "narration:" : "text:");
 			writeString(hash, block.text);
+			if (narrationSig) writeString(hash, narrationSig);
 		} else if (isReplayableThinking(message, block)) {
 			hash.update("thinking:");
 			writeString(hash, block.thinking ?? "");

@@ -4,6 +4,7 @@
 import type { Message as PiMessage } from "@earendil-works/pi-ai";
 import type { Message as SessionMessage, ToolResultBlock } from "cc-session-io";
 import { MCP_TOOL_PREFIX } from "./skills.js";
+import { decodeNarrationTextSignature } from "./narration.js";
 
 export const PROVIDER_ID = "claude-bridge";
 
@@ -138,7 +139,15 @@ export function convertPiMessages(
 			const blocks = [];
 			for (const block of content) {
 				if (block.type === "text" && block.text) {
-					blocks.push({ type: "text", text: block.text });
+					// Narration is shown as text but arrived as a signed thinking block, and
+					// goes back the way it came (narration.ts). Same-account rule as thinking
+					// below; from anywhere else it is only text the user saw.
+					const narrationSig = decodeNarrationTextSignature(block.textSignature);
+					if (narrationSig && msg.provider === providerId) {
+						blocks.push({ type: "thinking", thinking: block.text, signature: narrationSig });
+					} else {
+						blocks.push({ type: "text", text: block.text });
+					}
 				} else if (block.type === "thinking") {
 					// Only replay thinking this account's Claude Code produced. A signature
 					// minted by any other provider — including pi's own Anthropic provider,

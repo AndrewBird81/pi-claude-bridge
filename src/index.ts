@@ -9,6 +9,7 @@ import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from 
 import { homedir } from "os";
 import { dirname } from "path";
 import { PROVIDER_ID, messageContentToText } from "./convert.js";
+import { encodeNarrationTextSignature, isNarrationSignature } from "./narration.js";
 import { QueryProcess } from "./query-process.js";
 import { readTranscript, recordedToolResults, resolveRecordingCut, savePrefixSession } from "./session-transcript.js";
 import { debugLogPath, diagLogPath } from "./log-paths.js";
@@ -1109,6 +1110,32 @@ function pushTextBlock(c: QueryContext, text: string): void {
 	c.currentPiStream?.push({ type: "text_end", contentIndex: idx, content: text, partial: c.turnOutput });
 }
 
+/** A completed SDK thinking block as pi content. Narration — Claude's status
+ *  updates for the user — becomes visible text carrying its signature for replay;
+ *  everything else stays thinking. See narration.ts. */
+function thinkingContent(thinking: string, signature: string): AssistantMessage["content"][number] {
+	return thinking.trim() && isNarrationSignature(signature)
+		? { type: "text", text: thinking, textSignature: encodeNarrationTextSignature(signature) }
+		: { type: "thinking", thinking, thinkingSignature: signature };
+}
+
+/** Append a completed thinking block to the turn and stream it to pi. */
+function pushThinkingBlock(c: QueryContext, thinking: string, signature: string): void {
+	ensureTurnStarted(c);
+	const block = thinkingContent(thinking, signature);
+	c.turnBlocks.push(block);
+	const idx = c.turnBlocks.length - 1;
+	if (block.type === "text") {
+		c.currentPiStream?.push({ type: "text_start", contentIndex: idx, partial: c.turnOutput! });
+		c.currentPiStream?.push({ type: "text_delta", contentIndex: idx, delta: thinking, partial: c.turnOutput! });
+		c.currentPiStream?.push({ type: "text_end", contentIndex: idx, content: thinking, partial: c.turnOutput! });
+		return;
+	}
+	c.currentPiStream?.push({ type: "thinking_start", contentIndex: idx, partial: c.turnOutput! });
+	if (thinking) c.currentPiStream?.push({ type: "thinking_delta", contentIndex: idx, delta: thinking, partial: c.turnOutput! });
+	c.currentPiStream?.push({ type: "thinking_end", contentIndex: idx, content: thinking, partial: c.turnOutput! });
+}
+
 function claimCurrentPiStream(stream: AssistantMessageEventStream, label: string, c: QueryContext, options: SimpleStreamOptions | undefined): void {
 	if (c.currentPiStream && !completedStreams.has(c.currentPiStream as object)) {
 		debug(`WARNING: currentPiStream overwritten before terminal event (${label}); activeQuery=${Boolean(c.activeQuery)} pendingHandlers=${c.pendingToolCalls.size}`);
@@ -1200,7 +1227,7 @@ function tapRecording(message: SDKMessage, names: Map<string, string>, c: QueryC
 	if (!step.emitted) c.lastAssistantMessageId = id;
 	for (const block of message.message.content) {
 		if (block.type === "text" && block.text) step.content.push({ type: "text", text: block.text });
-		else if (block.type === "thinking") step.content.push({ type: "thinking", thinking: block.thinking, thinkingSignature: block.signature });
+		else if (block.type === "thinking") step.content.push(thinkingContent(block.thinking, block.signature));
 		else if (block.type === "tool_use") {
 			const name = piToolNameFor(block.name, names);
 			if (name) step.content.push({ type: "toolCall", id: block.id, name, arguments: mapToolArgs(name, block.input as Record<string, unknown>) } as AssistantMessage["content"][number]);
@@ -1254,8 +1281,7 @@ function processStreamEvent(
 			c.turnBlocks.push({ type: "text", text: "", index: event.index });
 			c.currentPiStream!.push({ type: "text_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
 		} else if (event.content_block?.type === "thinking") {
-			c.turnBlocks.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index });
-			c.currentPiStream!.push({ type: "thinking_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
+			c.pendingThinking.set(event.index, { thinking: "", signature: "" });
 		} else if (event.content_block?.type === "tool_use") {
 			const piName = piToolNameFor(event.content_block.name, customToolNameToPi);
 			if (!piName) {
@@ -1277,21 +1303,23 @@ function processStreamEvent(
 	}
 
 	if (event?.type === "content_block_delta") {
+		const pending = c.pendingThinking.get(event.index);
+		if (pending) {
+			if (event.delta?.type === "thinking_delta") pending.thinking += event.delta.thinking;
+			else if (event.delta?.type === "signature_delta") pending.signature += event.delta.signature;
+			else debug("processStreamEvent: unhandled thinking delta type", event.delta?.type);
+			return;
+		}
 		const index = c.turnBlocks.findIndex((b: any) => b.index === event.index);
 		const block = c.turnBlocks[index];
 		if (!block) return;
 		if (event.delta?.type === "text_delta" && block.type === "text") {
 			block.text += event.delta.text;
 			c.currentPiStream!.push({ type: "text_delta", contentIndex: index, delta: event.delta.text, partial: c.turnOutput });
-		} else if (event.delta?.type === "thinking_delta" && block.type === "thinking") {
-			block.thinking += event.delta.thinking;
-			c.currentPiStream!.push({ type: "thinking_delta", contentIndex: index, delta: event.delta.thinking, partial: c.turnOutput });
 		} else if (event.delta?.type === "input_json_delta" && block.type === "toolCall") {
 			block.partialJson += event.delta.partial_json;
 			block.arguments = parsePartialJson(block.partialJson, block.arguments);
 			c.currentPiStream!.push({ type: "toolcall_delta", contentIndex: index, delta: event.delta.partial_json, partial: c.turnOutput });
-		} else if (event.delta?.type === "signature_delta" && block.type === "thinking") {
-			block.thinkingSignature = (block.thinkingSignature ?? "") + event.delta.signature;
 		} else {
 			debug("processStreamEvent: unhandled content_block_delta type", event.delta?.type);
 		}
@@ -1299,14 +1327,18 @@ function processStreamEvent(
 	}
 
 	if (event?.type === "content_block_stop") {
+		const pending = c.pendingThinking.get(event.index);
+		if (pending) {
+			c.pendingThinking.delete(event.index);
+			pushThinkingBlock(c, pending.thinking, pending.signature);
+			return;
+		}
 		const index = c.turnBlocks.findIndex((b: any) => b.index === event.index);
 		const block = c.turnBlocks[index];
 		if (!block) return;
 		delete block.index;
 		if (block.type === "text") {
 			c.currentPiStream!.push({ type: "text_end", contentIndex: index, content: block.text, partial: c.turnOutput });
-		} else if (block.type === "thinking") {
-			c.currentPiStream!.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: c.turnOutput });
 		} else if (block.type === "toolCall") {
 			c.turnSawToolCall = true;
 			// CC's finished tool_use (already in assistantSteps) carries the input it
@@ -1393,6 +1425,7 @@ function dropAbandonedStreamBlocks(c: QueryContext, why: string): void {
 	c.turnToolCallIds = [];
 	c.turnSawToolCall = c.turnBlocks.some((b: any) => b.type === "toolCall");
 	c.turnStreamOpen = false;
+	c.pendingThinking.clear();
 }
 
 // The SDK always yields `assistant` messages (completed content blocks) after streaming.
@@ -1452,12 +1485,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 		if (block.type === "text" && block.text) {
 			pushTextBlock(c, block.text);
 		} else if (block.type === "thinking") {
-			ensureTurnStarted(c);
-			c.turnBlocks.push({ type: "thinking", thinking: block.thinking ?? "", thinkingSignature: block.signature ?? "" });
-			const idx = c.turnBlocks.length - 1;
-			c.currentPiStream?.push({ type: "thinking_start", contentIndex: idx, partial: c.turnOutput });
-			if (block.thinking) c.currentPiStream?.push({ type: "thinking_delta", contentIndex: idx, delta: block.thinking, partial: c.turnOutput });
-			c.currentPiStream?.push({ type: "thinking_end", contentIndex: idx, content: block.thinking ?? "", partial: c.turnOutput });
+			pushThinkingBlock(c, block.thinking ?? "", block.signature ?? "");
 		} else if (block.type === "tool_use") {
 			const piName = piToolNameFor(block.name, customToolNameToPi);
 			if (!piName) {

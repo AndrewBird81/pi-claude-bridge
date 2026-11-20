@@ -1,5 +1,9 @@
 # Changelog
 
+## UNRELEASED
+
+- **Fix: Claude's mid-turn status updates show as text, not thinking** — Opus 5.5 sends progress notes as `thinking` blocks labelled `narration` in their signature, so pi collapsed them as thoughts and long turns looked stalled. They now arrive as visible text, in order with tool calls, and replay to Claude as the signed thinking block they came as (same account only). Thinking blocks now appear when complete rather than streaming.
+
 ## 0.12.0 — 2026-11-10
 
 - **Add: Claude Fable 5.2 with 1M context** — Agent SDK bumped to 0.3.321 (Claude Code 2.1.321), which knows Fable 5.2; AskClaude's too.

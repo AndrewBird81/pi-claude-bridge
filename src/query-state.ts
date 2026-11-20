@@ -124,6 +124,10 @@ export class QueryContext {
 	/** API message id of the non-streaming fallback being delivered from `assistant`
 	 *  messages. The SDK hands it over one block per message, all under this id. */
 	turnFallbackMessageId: string | undefined;
+	/** Thinking blocks still streaming, keyed by API block index. Held back until
+	 *  content_block_stop because only the signature says whether a block is
+	 *  thinking or narration, and it arrives last (see narration.ts). */
+	pendingThinking = new Map<number, { thinking: string; signature: string }>();
 
 	get turnBlocks(): Array<any> {
 		if (!this.turnOutput) throw new Error("turnBlocks accessed before resetTurnState");
@@ -153,6 +157,7 @@ export class QueryContext {
 		this.turnStreamOpen = false;
 		this.turnStreamBlockStart = 0;
 		this.turnFallbackMessageId = undefined;
+		this.pendingThinking.clear();
 		// turnToolCallIds is NOT reset — it persists across tool-result delivery
 		// callbacks within the same assistant message so results can be routed to
 		// this query while its handlers are still pending.
